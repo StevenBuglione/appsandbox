@@ -55,6 +55,9 @@
 #define DISPLAY_REFRESH         60u
 #define ASB_DRM_MODE_PATH       "/sys/devices/platform/asb_drm.0/mode"
 #define MUTTER_RESIZE_HELPER    "/usr/local/bin/appsandbox-mutter-resize"
+#define WLR_RANDR_HELPER        "wlr-randr"
+#define ASB_DRM_OUTPUT_NAME     "Virtual-1"
+#define HYPERV_OUTPUT_NAME      "Virtual-2"
 
 /* ---- Global state for the currently-active client connection ---- */
 
@@ -215,6 +218,30 @@ static void find_mutter_xauth(uid_t uid, char *out, size_t cap)
     closedir(d);
 }
 
+/* Find a live Wayland compositor socket for a user. Unlike the Mutter XWayland
+ * cookie above, this also works for the deliberately X11-free Cage appliance. */
+static void find_wayland_socket(uid_t uid, char *out, size_t cap)
+{
+    char xdg_rt[64];
+    snprintf(xdg_rt, sizeof(xdg_rt), "/run/user/%u", (unsigned)uid);
+    DIR *d = opendir(xdg_rt);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        char path[512];
+        struct stat st;
+
+        if (strncmp(de->d_name, "wayland-", 8) != 0)
+            continue;
+        snprintf(path, sizeof(path), "%s/%s", xdg_rt, de->d_name);
+        if (stat(path, &st) == 0 && S_ISSOCK(st.st_mode)) {
+            snprintf(out, cap, "%s", path);
+            break;
+        }
+    }
+    closedir(d);
+}
+
 /* True if the UID looks like a regular human user we can spawn the
  * clipboard helper as — has a /home/... directory and a real login shell.
  *
@@ -238,13 +265,12 @@ static int uid_is_real_user(uid_t uid)
     return 1;
 }
 
-/* Scan /run/user for the UID whose runtime dir has a Mutter XWayland auth
- * cookie AND who looks like a real user (not gdm). That's the user whose
- * graphical session we want to spawn the clipboard helper into. Returns
- * 0 (not found) or a valid uid_t.
+/* Scan /run/user for the UID whose runtime dir has either a Mutter XWayland
+ * auth cookie or a live Wayland socket and who looks like a real user (not
+ * gdm). Returns 0 (not found) or a valid uid_t.
  *
  * We can't hardcode a username — the create-VM modal lets the user pick
- * any account name. Looking for the live mutter xauth file is more robust
+ * any account name. Looking for a live compositor endpoint is more robust
  * than parsing /etc/passwd because it implicitly filters for "user who
  * actually has a graphical session right now". */
 static uid_t find_graphical_session_uid(void)
@@ -260,23 +286,28 @@ static uid_t find_graphical_session_uid(void)
         if (!end || *end != '\0' || v < 1000 || v >= 65534) continue;
         if (!uid_is_real_user((uid_t)v)) continue;
         char xauth[512] = {0};
+        char wayland[512] = {0};
         find_mutter_xauth((uid_t)v, xauth, sizeof(xauth));
-        if (xauth[0]) { found = (uid_t)v; break; }
+        find_wayland_socket((uid_t)v, wayland, sizeof(wayland));
+        if (xauth[0] || wayland[0]) { found = (uid_t)v; break; }
     }
     closedir(d);
     return found;
 }
 
-/* User session is "ready" once Mutter has dropped its XWayland auth
- * cookie. Before that, xcb_connect would fail with the no-auth-protocol
- * error we saw on early spawns. */
+/* A compositor session is ready once either Mutter has dropped its XWayland
+ * cookie or a compositor has published a Wayland socket. */
 static int is_user_session_ready(uid_t uid)
 {
     char xauth[512] = {0};
-    find_mutter_xauth(uid, xauth, sizeof(xauth));
-    if (xauth[0] == '\0') return 0;
+    char wayland[512] = {0};
     struct stat st;
-    return stat(xauth, &st) == 0 && S_ISREG(st.st_mode);
+
+    find_mutter_xauth(uid, xauth, sizeof(xauth));
+    if (xauth[0] && stat(xauth, &st) == 0 && S_ISREG(st.st_mode))
+        return 1;
+    find_wayland_socket(uid, wayland, sizeof(wayland));
+    return wayland[0] && stat(wayland, &st) == 0 && S_ISSOCK(st.st_mode);
 }
 
 static void kill_clipboard_helper_locked(void)
@@ -321,6 +352,17 @@ static void spawn_clipboard_helper_locked(void)
     if (!is_user_session_ready(pw->pw_uid)) {
         /* Will retry on the next monitor tick. */
         return;
+    }
+
+    /* The current clipboard bridge is XCB-based and relies on Mutter's
+     * XWayland bridge. A pure Cage session is still display-ready, but must
+     * not crash-loop this helper until a native Wayland clipboard bridge is
+     * supplied. */
+    {
+        char xauth[512] = {0};
+        find_mutter_xauth(pw->pw_uid, xauth, sizeof(xauth));
+        if (xauth[0] == '\0')
+            return;
     }
 
     int writer_fd = vsock_bind_listen_privileged(5);
@@ -541,6 +583,79 @@ static int apply_mutter_display_mode(unsigned int width, unsigned int height)
     return WEXITSTATUS(status);
 }
 
+/* Cage exposes zwlr_output_manager_v1. Apply the new asb_drm mode through
+ * that protocol, keeping the firmware Hyper-V output out of the one-surface
+ * appliance layout. */
+static int apply_wlroots_display_mode(unsigned int width, unsigned int height)
+{
+    uid_t uid = find_graphical_session_uid();
+    struct passwd *pw;
+    pid_t pid;
+    int status;
+    char mode_arg[40];
+    char wayland_socket[512] = {0};
+    const char *wayland_name;
+
+    if (uid == 0)
+        return -1;
+    find_wayland_socket(uid, wayland_socket, sizeof(wayland_socket));
+    if (wayland_socket[0] == '\0')
+        return -1;
+    pw = getpwuid(uid);
+    if (!pw)
+        return -1;
+
+    wayland_name = strrchr(wayland_socket, '/');
+    wayland_name = wayland_name ? wayland_name + 1 : wayland_socket;
+    snprintf(mode_arg, sizeof(mode_arg), "%ux%u@%uHz", width, height,
+             DISPLAY_REFRESH);
+
+    pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        char xdg_runtime[64];
+
+        if (setgid(pw->pw_gid) < 0 ||
+            initgroups(pw->pw_name, pw->pw_gid) < 0 ||
+            setuid(pw->pw_uid) < 0)
+            _exit(126);
+
+        snprintf(xdg_runtime, sizeof(xdg_runtime), "/run/user/%u",
+                 (unsigned)pw->pw_uid);
+        setenv("HOME", pw->pw_dir, 1);
+        setenv("USER", pw->pw_name, 1);
+        setenv("LOGNAME", pw->pw_name, 1);
+        setenv("XDG_RUNTIME_DIR", xdg_runtime, 1);
+        setenv("WAYLAND_DISPLAY", wayland_name, 1);
+
+        execlp(WLR_RANDR_HELPER, WLR_RANDR_HELPER,
+               "--output", ASB_DRM_OUTPUT_NAME,
+               "--custom-mode", mode_arg,
+               "--pos", "0,0",
+               "--output", HYPERV_OUTPUT_NAME,
+               "--off", (char *)NULL);
+        _exit(127);
+    }
+
+    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status))
+        return -1;
+    return WEXITSTATUS(status);
+}
+
+static int apply_session_display_mode(unsigned int width, unsigned int height)
+{
+    uid_t uid = find_graphical_session_uid();
+    char xauth[512] = {0};
+
+    if (uid == 0)
+        return -1;
+    find_mutter_xauth(uid, xauth, sizeof(xauth));
+    if (xauth[0])
+        return apply_mutter_display_mode(width, height);
+    return apply_wlroots_display_mode(width, height);
+}
+
 static void handle_display_resize(int fd, const char *tag, const char *args)
 {
     unsigned int width, height, refresh;
@@ -587,15 +702,15 @@ static void handle_display_resize(int fd, const char *tag, const char *args)
 
     agent_log("display_resize: requested %s", mode);
     {
-        int mutter_result = apply_mutter_display_mode(width, height);
-        if (mutter_result != 0) {
-            agent_log("display_resize: Mutter apply %ux%u failed (exit=%d)",
-                      width, height, mutter_result);
+        int session_result = apply_session_display_mode(width, height);
+        if (session_result != 0) {
+            agent_log("display_resize: compositor apply %ux%u failed (exit=%d)",
+                      width, height, session_result);
             send_reply(fd, tag, "error:session_mode_failed");
             return;
         }
     }
-    agent_log("display_resize: Mutter applied %ux%u", width, height);
+    agent_log("display_resize: compositor applied %ux%u", width, height);
     send_reply(fd, tag, "ok");
 }
 

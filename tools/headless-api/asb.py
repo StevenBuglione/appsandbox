@@ -136,13 +136,18 @@ class Client:
     def templates(self):         return self._req("GET", "/templates")[1].get("templates", [])
     def delete_template(self, name): return self._req("DELETE", "/templates/" + name)
     def ssh_info(self, name):    return self._req("GET", "/vms/%s/sshInfo" % name)[1]
-    def open_display(self, name):
+    def open_display(self, name, **options):
         """Open the VM's display window on the daemon's local desktop (the GUI's
         Connect view). The VM must be running, and the daemon must be in an
         interactive session that can show a window (a headless/SSH/service daemon
         returns 409 "no_display"). Returns (status, body); status() reports
-        displayOpen, which also goes false if the user closes the window."""
-        return self._req("POST", "/vms/%s/display" % name)
+        displayOpen, which also goes false if the user closes the window.
+
+        Application mode accepts mode="application", title, width, height,
+        minimumWidth, minimumHeight, appUserModelId, iconPath,
+        showDebugTitle, and showDebugOverlay. With no options this preserves the
+        normal App Sandbox display window."""
+        return self._req("POST", "/vms/%s/display" % name, options or None)
     def close_display(self, name): return self._req("DELETE", "/vms/%s/display" % name)
     def display_status(self, name):
         """{'open': bool, 'ready': bool}. 'ready' is the agent's own report that the

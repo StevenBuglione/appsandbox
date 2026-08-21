@@ -62,6 +62,7 @@ caps = v.get("capabilities", {})
 check("capabilities advertised", isinstance(caps.get("snapshots"), bool) and isinstance(caps.get("templates"), bool), "%s" % caps)
 if not IS_MAC:
     check("prebuilt Linux disk capability advertised", caps.get("prebuiltLinuxDisk") is True, "%s" % caps)
+    check("application display capability advertised", caps.get("applicationDisplay") is True, "%s" % caps)
 if caps.get("templates"):
     check("templates is a list", isinstance(c.templates(), list))
 else:

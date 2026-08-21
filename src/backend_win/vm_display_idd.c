@@ -12,9 +12,12 @@
  */
 
 #include <winsock2.h>
-#include <windows.h>
-
 #define COBJMACROS
+#include <windows.h>
+#include <dwmapi.h>
+#include <shobjidl.h>
+#include <propkey.h>
+
 #include <initguid.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
@@ -43,6 +46,8 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "propsys.lib")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -218,6 +223,20 @@ struct VmDisplayIdd {
     HWND         hwnd;
     volatile BOOL open;
     volatile BOOL stop;
+
+    /* Application-window identity and sizing. These are owned copies because
+       the display outlives the API request that creates it. */
+    BOOL         app_mode;
+    wchar_t      window_title[256];
+    wchar_t      app_user_model_id[256];
+    wchar_t      icon_path[MAX_PATH];
+    UINT         initial_width;
+    UINT         initial_height;
+    UINT         minimum_width;
+    UINT         minimum_height;
+    BOOL         show_debug_title;
+    BOOL         show_debug_overlay;
+    HICON        custom_icon;
 
     /* D3D11 */
     ID3D11Device            *device;
@@ -479,6 +498,49 @@ static void ensure_idd_class(HINSTANCE hInst)
     RegisterClassExW(&wc);
 
     g_idd_class_registered = TRUE;
+}
+
+static void idd_update_window_title(VmDisplayIdd *d)
+{
+    wchar_t title[300];
+    const wchar_t *base;
+
+    if (!d || !d->hwnd) return;
+    base = d->window_title[0] ? d->window_title : d->vm_name;
+
+    if (d->app_mode && !d->show_debug_title) {
+        SetWindowTextW(d->hwnd, base);
+        return;
+    }
+
+    if (d->app_mode) {
+        swprintf_s(title, 300, L"%s%s — %ux%u",
+                   d->audio_muted ? L"\U0001F507 " : L"", base,
+                   d->frame_width, d->frame_height);
+    } else {
+        swprintf_s(title, 300, L"%s%s - IDD Display %ux%u",
+                   d->audio_muted ? L"\U0001F507 " : L"", base,
+                   d->frame_width, d->frame_height);
+    }
+    SetWindowTextW(d->hwnd, title);
+}
+
+static void idd_set_window_app_id(HWND hwnd, const wchar_t *app_id)
+{
+    IPropertyStore *store = NULL;
+    PROPVARIANT value;
+
+    if (!hwnd || !app_id || !app_id[0]) return;
+    if (FAILED(SHGetPropertyStoreForWindow(hwnd, &IID_IPropertyStore,
+                                            (void **)&store)) || !store)
+        return;
+
+    PropVariantInit(&value);
+    value.vt = VT_LPWSTR;
+    value.pwszVal = (LPWSTR)app_id;
+    store->lpVtbl->SetValue(store, &PKEY_AppUserModel_ID, &value);
+    store->lpVtbl->Commit(store);
+    store->lpVtbl->Release(store);
 }
 
 
@@ -1527,13 +1589,10 @@ static void d3d_render_frame(VmDisplayIdd *d)
         vp.MaxDepth = 1.0f;
     }
 
-    /* Refresh the title once per uploaded frame (~frame rate). */
-    if (frame_uploaded && d->hwnd) {
-        wchar_t title[256];
-        swprintf_s(title, 256, L"%s%s Display %ux%u recv=%u",
-                   d->audio_muted ? L"\U0001F507 " : L"",
-                   d->vm_name, d->frame_width, d->frame_height, d->recv_count);
-        SetWindowTextW(d->hwnd, title);
+    /* Preserve the clean product title in application mode. */
+    if (frame_uploaded && d->hwnd &&
+        (!d->app_mode || d->show_debug_title)) {
+        idd_update_window_title(d);
     }
     d->render_count++;
 
@@ -2164,16 +2223,22 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     wchar_t title[300];
     MSG msg;
 
+    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ensure_idd_class(d->hInstance);
 
-    swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
+    if (d->app_mode)
+        wcscpy_s(title, 300, d->window_title[0]
+                              ? d->window_title : L"Linguum Runtime POC");
+    else
+        swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
 
-    /* Compute outer window size so the client area is exactly 1920x1080 */
+    /* Compute the outer size from the requested physical client pixels. */
     {
         DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
-        DWORD exstyle = 0;
-        RECT wr = { 0, 0, 1920, 1080 };
-        AdjustWindowRectEx(&wr, style, FALSE, exstyle);
+        DWORD exstyle = d->app_mode ? WS_EX_APPWINDOW : 0;
+        RECT wr = { 0, 0, (LONG)d->initial_width, (LONG)d->initial_height };
+        UINT dpi = GetDpiForSystem();
+        AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, dpi);
 
         d->hwnd = CreateWindowExW(
             exstyle, IDD_DISPLAY_CLASS, title, style,
@@ -2188,14 +2253,24 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         return 1;
     }
 
+    idd_set_window_app_id(d->hwnd, d->app_user_model_id);
+    if (d->icon_path[0]) {
+        d->custom_icon = (HICON)LoadImageW(NULL, d->icon_path, IMAGE_ICON,
+                                          0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE);
+        if (d->custom_icon) {
+            SendMessageW(d->hwnd, WM_SETICON, ICON_BIG, (LPARAM)d->custom_icon);
+            SendMessageW(d->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)d->custom_icon);
+        }
+    }
+
     /* Dark mode title bar to match AppSandbox main window */
     {
         BOOL dark = TRUE;
         DwmSetWindowAttribute(d->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
     }
 
-    /* Add options to the system menu (right-click title bar) */
-    {
+    /* VM/debug controls never appear on an application-mode window. */
+    if (!d->app_mode) {
         HMENU sysmenu = GetSystemMenu(d->hwnd, FALSE);
         if (sysmenu) {
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
@@ -2224,8 +2299,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             d->hwnd, NULL, d->hInstance, NULL);
     }
 
-    /* Separate top-level log window */
-    {
+    /* The application gate has no App Sandbox debug-log window. */
+    if (d->show_debug_overlay) {
         wchar_t log_title[300];
         HFONT font;
         swprintf_s(log_title, 300, L"%s - IDD Log", d->vm_name);
@@ -2324,17 +2399,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SYSCOMMAND:
         if (d && (wp & 0xFFF0) == IDM_AUDIO_MUTE) {
             HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
-            wchar_t title[300];
             d->audio_muted = !d->audio_muted;
             if (sysmenu) {
                 CheckMenuItem(sysmenu, IDM_AUDIO_MUTE,
                               MF_BYCOMMAND | (d->audio_muted ? MF_CHECKED : MF_UNCHECKED));
             }
-            if (d->audio_muted)
-                swprintf_s(title, 300, L"\U0001F507 %s - IDD Display", d->vm_name);
-            else
-                swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
-            SetWindowTextW(hwnd, title);
+            idd_update_window_title(d);
             idd_log(d, d->audio_muted ? L"Audio muted." : L"Audio unmuted.");
             return 0;
         }
@@ -2436,6 +2506,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 DestroyCursor(d->guest_cursor);
                 d->guest_cursor = NULL;
             }
+            if (d->custom_icon) {
+                DestroyIcon(d->custom_icon);
+                d->custom_icon = NULL;
+            }
 
             /* Notify main UI only if user closed the window */
             if (user_initiated && d->main_hwnd && d->vm)
@@ -2459,8 +2533,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
         UINT dpi = GetDpiForWindow(hwnd);
         RECT wr;
-        /* Minimum: 320x180 client area */
-        wr.left = 0; wr.top = 0; wr.right = 320; wr.bottom = 180;
+        wr.left = 0; wr.top = 0;
+        wr.right = d ? (LONG)d->minimum_width : 320;
+        wr.bottom = d ? (LONG)d->minimum_height : 180;
         AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, dpi);
         mmi->ptMinTrackSize.x = wr.right - wr.left;
         mmi->ptMinTrackSize.y = wr.bottom - wr.top;
@@ -2694,7 +2769,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  * Public API
  * ================================================================== */
 
-VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND main_hwnd)
+VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
+                                       HWND main_hwnd,
+                                       const AsbDisplayOptions *options)
 {
     VmDisplayIdd *d;
 
@@ -2718,11 +2795,31 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->input_socket       = INVALID_SOCKET;
     d->audio_socket       = INVALID_SOCKET;
     d->clipboard          = NULL;
+    d->app_mode           = options ? options->app_mode : FALSE;
+    d->initial_width      = options && options->initial_width
+                                ? options->initial_width : DEFAULT_WIDTH;
+    d->initial_height     = options && options->initial_height
+                                ? options->initial_height : DEFAULT_HEIGHT;
+    d->minimum_width      = options && options->minimum_width
+                                ? options->minimum_width : 320;
+    d->minimum_height     = options && options->minimum_height
+                                ? options->minimum_height : 180;
+    d->show_debug_title   = options ? options->show_debug_title : TRUE;
+    d->show_debug_overlay = options ? options->show_debug_overlay : TRUE;
+    if (options && options->window_title)
+        wcsncpy_s(d->window_title, 256, options->window_title, _TRUNCATE);
+    if (options && options->app_user_model_id)
+        wcsncpy_s(d->app_user_model_id, 256,
+                  options->app_user_model_id, _TRUNCATE);
+    if (options && options->icon_path)
+        wcsncpy_s(d->icon_path, MAX_PATH, options->icon_path, _TRUNCATE);
 
     /* Load the per-VM display setting, creating display_settings.json with
        the default (off) if this VM doesn't have one yet. The hook itself is
        installed later, on the window thread, once the window exists. */
     d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path);
+    if (d->app_mode)
+        d->transmit_hotkeys = FALSE;
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;
@@ -2782,6 +2879,12 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     }
 
     return d;
+}
+
+VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance,
+                                    HWND main_hwnd)
+{
+    return vm_display_idd_create_ex(vm, hInstance, main_hwnd, NULL);
 }
 
 void vm_display_idd_destroy(VmDisplayIdd *display)
@@ -2859,6 +2962,9 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
 
     if (display->frame_buf)
         HeapFree(GetProcessHeap(), 0, display->frame_buf);
+
+    if (display->custom_icon)
+        DestroyIcon(display->custom_icon);
 
     HeapFree(GetProcessHeap(), 0, display);
 }

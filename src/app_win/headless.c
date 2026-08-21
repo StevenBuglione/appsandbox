@@ -578,7 +578,8 @@ static int handle_request(PHTTP_REQUEST req)
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/version") == 0) {
         sprintf_s(buf, sizeof(buf),
             "{\"product\":\"AppSandbox\",\"version\":\"%s\",\"apiVersion\":\"%s\",\"hostOs\":\"Windows\","
-            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"prebuiltLinuxDisk\":true}}",
+            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"prebuiltLinuxDisk\":true,"
+            "\"applicationDisplay\":true}}",
             ASB_PRODUCT_VER, ASB_API_VERSION);
         send_json(req->RequestId, 200, "OK", buf);
         return 0;
@@ -840,6 +841,81 @@ static int handle_request(PHTTP_REQUEST req)
             display_reap_stale(v->unique_id);   /* drop a self-closed (X) display first */
             if (verb == HttpVerbPOST) {
                 DisplayEntry *e;
+                AsbDisplayOptions display_options;
+                wchar_t body[2048];
+                wchar_t mode[32] = {0};
+                wchar_t title[256] = L"Linguum Runtime POC";
+                wchar_t app_id[256] = L"com.linguum.Runtime.POC";
+                wchar_t icon_path[MAX_PATH] = {0};
+                int iv;
+                BOOL bv;
+
+                ZeroMemory(&display_options, sizeof(display_options));
+                body_to_wide(req, body, 2048);
+                json_get_string(body, L"mode", mode, 32);
+                trim_ws(mode);
+                if (mode[0] && _wcsicmp(mode, L"application") != 0 &&
+                    _wcsicmp(mode, L"display") != 0) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "mode must be 'application' or 'display'");
+                    return 0;
+                }
+                display_options.app_mode = _wcsicmp(mode, L"application") == 0;
+                display_options.initial_width = display_options.app_mode ? 1440 : 1920;
+                display_options.initial_height = display_options.app_mode ? 900 : 1080;
+                display_options.minimum_width = display_options.app_mode ? 800 : 320;
+                display_options.minimum_height = display_options.app_mode ? 500 : 180;
+                display_options.show_debug_title = !display_options.app_mode;
+                display_options.show_debug_overlay = !display_options.app_mode;
+
+                json_get_string(body, L"title", title, 256);
+                json_get_string(body, L"appUserModelId", app_id, 256);
+                json_get_string(body, L"iconPath", icon_path, MAX_PATH);
+                if (json_get_int(body, L"width", &iv))
+                    display_options.initial_width = (UINT)iv;
+                if (json_get_int(body, L"height", &iv))
+                    display_options.initial_height = (UINT)iv;
+                if (json_get_int(body, L"minimumWidth", &iv))
+                    display_options.minimum_width = (UINT)iv;
+                if (json_get_int(body, L"minimumHeight", &iv))
+                    display_options.minimum_height = (UINT)iv;
+                if (json_get_bool(body, L"showDebugTitle", &bv))
+                    display_options.show_debug_title = bv;
+                if (json_get_bool(body, L"showDebugOverlay", &bv))
+                    display_options.show_debug_overlay = bv;
+                trim_ws(title);
+                trim_ws(app_id);
+                trim_ws(icon_path);
+
+                if (display_options.initial_width < 320 ||
+                    display_options.initial_height < 180 ||
+                    display_options.initial_width > 7680 ||
+                    display_options.initial_height > 4320 ||
+                    display_options.minimum_width < 320 ||
+                    display_options.minimum_height < 180 ||
+                    display_options.minimum_width > display_options.initial_width ||
+                    display_options.minimum_height > display_options.initial_height) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "display dimensions are outside the supported range");
+                    return 0;
+                }
+                if (display_options.app_mode && !title[0]) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "application mode requires a non-empty title");
+                    return 0;
+                }
+                if (icon_path[0] &&
+                    !((wcslen(icon_path) >= 3 && icon_path[1] == L':' &&
+                       (icon_path[2] == L'\\' || icon_path[2] == L'/')) ||
+                      (icon_path[0] == L'\\' && icon_path[1] == L'\\'))) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "iconPath must be absolute");
+                    return 0;
+                }
+                display_options.window_title = title;
+                display_options.app_user_model_id = app_id;
+                display_options.icon_path = icon_path;
+
                 if (!host_can_show_window()) {
                     send_err(req->RequestId, 409, "Conflict", "no_display",
                              "no local interactive desktop is available to show the window "
@@ -871,7 +947,8 @@ static int handle_request(PHTTP_REQUEST req)
                         return 0;
                     }
                     e = &g_displays[slot];
-                    e->disp = vm_display_idd_create(v, g_hinst, NULL);
+                    e->disp = vm_display_idd_create_ex(v, g_hinst, NULL,
+                                                       &display_options);
                     if (!e->disp) {
                         e->vm_id = 0;
                         send_err(req->RequestId, 500, "Internal Server Error", "display_failed",
