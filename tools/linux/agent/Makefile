@@ -13,7 +13,8 @@ SYSTEMDDIR    := /etc/systemd/system
 USERUNITDIR   := /etc/systemd/user
 
 # Daemons get added here as each phase lands.
-BINS := appsandbox-agent appsandbox-display appsandbox-input appsandbox-audio appsandbox-clipboard
+BINS := appsandbox-agent appsandbox-display appsandbox-input appsandbox-audio appsandbox-clipboard \
+        appsandbox-mutter-resize
 
 SYSTEM_UNITS := systemd/appsandbox-agent.service \
                 systemd/appsandbox-display.service \
@@ -29,6 +30,10 @@ all: $(BINS)
 
 appsandbox-agent: appsandbox-agent.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+appsandbox-mutter-resize: appsandbox-mutter-resize.c
+	$(CC) $(CFLAGS) $(shell pkg-config --cflags gio-2.0) -o $@ $< \
+	       $(LDFLAGS) $(shell pkg-config --libs gio-2.0) -lm
 
 # Display daemon needs libdrm for drmModeGetFB2 + drmPrimeHandleToFD.
 appsandbox-display: appsandbox-display.c

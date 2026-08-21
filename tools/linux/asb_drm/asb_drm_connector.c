@@ -30,6 +30,44 @@
 
 static void put_le16(u8 *p, u16 v) { p[0] = v & 0xff; p[1] = v >> 8; }
 
+/* drm_cvt_mode() applies CVT's eight-pixel horizontal granularity. A real
+ * monitor needs that convention; this virtual scanout does not. Preserve the
+ * CVT porch/sync shape, extend it by the rounded-off active pixels, and adjust
+ * the pixel clock so arbitrary host client widths remain exact at 60 Hz. */
+static struct drm_display_mode *asb_create_mode(struct drm_device *drm,
+						 unsigned int width,
+						 unsigned int height,
+						 unsigned int refresh)
+{
+	struct drm_display_mode *mode;
+	u64 old_frame_total;
+	u64 new_frame_total;
+	int delta;
+
+	mode = drm_cvt_mode(drm, width, height, refresh,
+			    false, false, false);
+	if (!mode)
+		return NULL;
+
+	old_frame_total = (u64)mode->htotal * mode->vtotal;
+	delta = (int)width - mode->hdisplay;
+	mode->hdisplay += delta;
+	mode->hsync_start += delta;
+	mode->hsync_end += delta;
+	mode->htotal += delta;
+	delta = (int)height - mode->vdisplay;
+	mode->vdisplay += delta;
+	mode->vsync_start += delta;
+	mode->vsync_end += delta;
+	mode->vtotal += delta;
+
+	new_frame_total = (u64)mode->htotal * mode->vtotal;
+	mode->clock = DIV_ROUND_CLOSEST_ULL((u64)mode->clock * new_frame_total,
+					    old_frame_total);
+	drm_mode_set_name(mode);
+	return mode;
+}
+
 static void asb_fill_dtd(u8 dtd[18], const struct drm_display_mode *m)
 {
 	u16 clk100      = m->clock / 10;                      /* pixel clock / 10 kHz */
@@ -114,10 +152,9 @@ void asb_build_edid(struct asb_device *asb)
 
 	/* DTD #1 (bytes 54..71): the preferred mode, computed from CVT. */
 	{
-		struct drm_display_mode *cvt = drm_cvt_mode(NULL, asb->width,
-		                                            asb->height,
-		                                            asb->refresh,
-		                                            false, false, false);
+		struct drm_display_mode *cvt = asb_create_mode(NULL, asb->width,
+							      asb->height,
+							      asb->refresh);
 		if (cvt) {
 			m = *cvt;
 			drm_mode_destroy(NULL, cvt);
@@ -166,9 +203,8 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 	                                   (const struct edid *)asb->edid);
 
 	/* Preferred mode first — what the EDID DTD also points at. */
-	m = drm_cvt_mode(connector->dev,
-	                 asb->width, asb->height, asb->refresh,
-	                 false, false, false);
+	m = asb_create_mode(connector->dev, asb->width, asb->height,
+			    asb->refresh);
 	if (m) {
 		m->type |= DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER;
 		drm_mode_probed_add(connector, m);
@@ -191,10 +227,8 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 			if (fallbacks[i].w == (int)asb->width &&
 			    fallbacks[i].h == (int)asb->height)
 				continue;
-			m = drm_cvt_mode(connector->dev,
-			                 fallbacks[i].w, fallbacks[i].h,
-			                 fallbacks[i].hz,
-			                 false, false, false);
+			m = asb_create_mode(connector->dev, fallbacks[i].w,
+					    fallbacks[i].h, fallbacks[i].hz);
 			if (m) {
 				m->type |= DRM_MODE_TYPE_DRIVER;
 				drm_mode_probed_add(connector, m);

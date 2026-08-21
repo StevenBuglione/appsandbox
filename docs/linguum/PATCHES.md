@@ -23,3 +23,10 @@ The `linguum` branch contains only the dynamic Windows/Linux display-sizing POC.
 
 - Validated `display_resize` command dispatch
 - Runtime mode write through the existing Linux agent
+
+## LINGUUM-005 — Mutter session mode stabilization
+
+- One-shot user-session helper using Mutter's existing DisplayConfig API
+- Temporary exact-mode application after the virtual KMS hotplug
+- Exact arbitrary-width virtual modes without CVT's eight-pixel rounding
+- Per-monitor DPI changes and full-display client tracking limits

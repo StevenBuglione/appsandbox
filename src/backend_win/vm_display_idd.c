@@ -2401,12 +2401,32 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         MINMAXINFO *mmi = (MINMAXINFO *)lp;
         DWORD style   = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
         DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
+        UINT dpi = GetDpiForWindow(hwnd);
         RECT wr;
         /* Minimum: 320x180 client area */
         wr.left = 0; wr.top = 0; wr.right = 320; wr.bottom = 180;
-        AdjustWindowRectEx(&wr, style, FALSE, exstyle);
+        AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, dpi);
         mmi->ptMinTrackSize.x = wr.right - wr.left;
         mmi->ptMinTrackSize.y = wr.bottom - wr.top;
+
+        /* DefWindowProc seeds this with the monitor work-area limit. The
+           virtual display supports larger client sizes, including a full
+           2560x1440 client on a 2560x1440 host with decorations off-screen. */
+        wr.left = 0; wr.top = 0;
+        wr.right = MAX_FRAME_WIDTH; wr.bottom = MAX_FRAME_HEIGHT;
+        AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, dpi);
+        mmi->ptMaxTrackSize.x = wr.right - wr.left;
+        mmi->ptMaxTrackSize.y = wr.bottom - wr.top;
+        return 0;
+    }
+
+    case WM_DPICHANGED:
+    {
+        const RECT *suggested = (const RECT *)lp;
+        SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
+                     suggested->right - suggested->left,
+                     suggested->bottom - suggested->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
         return 0;
     }
 

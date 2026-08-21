@@ -54,6 +54,7 @@
 #define DISPLAY_MAX_HEIGHT      4320u
 #define DISPLAY_REFRESH         60u
 #define ASB_DRM_MODE_PATH       "/sys/devices/platform/asb_drm.0/mode"
+#define MUTTER_RESIZE_HELPER    "/usr/local/bin/appsandbox-mutter-resize"
 
 /* ---- Global state for the currently-active client connection ---- */
 
@@ -489,6 +490,57 @@ static void *heartbeat_thread(void *arg)
 
 /* ---- Command handlers ---- */
 
+static int apply_mutter_display_mode(unsigned int width, unsigned int height)
+{
+    uid_t uid = find_graphical_session_uid();
+    struct passwd *pw;
+    pid_t pid;
+    int status;
+    char width_arg[16];
+    char height_arg[16];
+
+    if (uid == 0 || !is_user_session_ready(uid))
+        return -1;
+    pw = getpwuid(uid);
+    if (!pw)
+        return -1;
+
+    snprintf(width_arg, sizeof(width_arg), "%u", width);
+    snprintf(height_arg, sizeof(height_arg), "%u", height);
+    pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        char xdg_runtime[64];
+        char session_bus[96];
+
+        if (setgid(pw->pw_gid) < 0 ||
+            initgroups(pw->pw_name, pw->pw_gid) < 0 ||
+            setuid(pw->pw_uid) < 0)
+            _exit(126);
+
+        snprintf(xdg_runtime, sizeof(xdg_runtime), "/run/user/%u",
+                 (unsigned)pw->pw_uid);
+        snprintf(session_bus, sizeof(session_bus), "unix:path=%s/bus",
+                 xdg_runtime);
+        setenv("HOME", pw->pw_dir, 1);
+        setenv("USER", pw->pw_name, 1);
+        setenv("LOGNAME", pw->pw_name, 1);
+        setenv("XDG_RUNTIME_DIR", xdg_runtime, 1);
+        setenv("DBUS_SESSION_BUS_ADDRESS", session_bus, 1);
+
+        execl(MUTTER_RESIZE_HELPER, "appsandbox-mutter-resize",
+              width_arg, height_arg, (char *)NULL);
+        _exit(127);
+    }
+
+    if (waitpid(pid, &status, 0) < 0)
+        return -1;
+    if (!WIFEXITED(status))
+        return -1;
+    return WEXITSTATUS(status);
+}
+
 static void handle_display_resize(int fd, const char *tag, const char *args)
 {
     unsigned int width, height, refresh;
@@ -534,6 +586,16 @@ static void handle_display_resize(int fd, const char *tag, const char *args)
     }
 
     agent_log("display_resize: requested %s", mode);
+    {
+        int mutter_result = apply_mutter_display_mode(width, height);
+        if (mutter_result != 0) {
+            agent_log("display_resize: Mutter apply %ux%u failed (exit=%d)",
+                      width, height, mutter_result);
+            send_reply(fd, tag, "error:session_mode_failed");
+            return;
+        }
+    }
+    agent_log("display_resize: Mutter applied %ux%u", width, height);
     send_reply(fd, tag, "ok");
 }
 
