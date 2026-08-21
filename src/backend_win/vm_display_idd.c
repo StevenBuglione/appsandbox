@@ -116,6 +116,7 @@ typedef struct AudioFrameHeader {
 #define INPUT_MOUSE_BUTTON  1
 #define INPUT_MOUSE_WHEEL   2
 #define INPUT_KEY           3
+#define INPUT_FRAME_SIZE    4
 
 /* Button IDs for INPUT_MOUSE_BUTTON */
 #define INPUT_BTN_LEFT      0
@@ -123,11 +124,12 @@ typedef struct AudioFrameHeader {
 #define INPUT_BTN_MIDDLE    2
 
 #define INPUT_READY_MAGIC   0x59445249  /* "IRDY" little-endian */
+#define INPUT_READY_MAGIC_V2 0x32565249 /* "IRV2": accepts INPUT_FRAME_SIZE */
 
 #pragma pack(push, 1)
 typedef struct InputPacket {
     UINT32 magic;   /* INPUT_MAGIC */
-    UINT32 type;    /* INPUT_MOUSE_MOVE / BUTTON / WHEEL / KEY */
+    UINT32 type;    /* INPUT_MOUSE_MOVE / BUTTON / WHEEL / KEY / FRAME_SIZE */
     UINT32 param1;
     UINT32 param2;
     UINT32 param3;
@@ -259,6 +261,8 @@ struct VmDisplayIdd {
 
     /* Input forwarding */
     volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
+    CRITICAL_SECTION input_send_cs; /* keeps fixed-size stream packets atomic */
+    volatile BOOL  input_frame_size_supported;
     BOOL           mouse_in;        /* TRUE while cursor is inside the render area */
     BOOL           tracking;        /* TrackMouseEvent active */
 
@@ -642,14 +646,19 @@ static DWORD WINAPI idd_resize_thread_proc(LPVOID param)
 
 static UINT g_input_send_count = 0;
 
-static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
+static BOOL send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
 {
     InputPacket pkt;
     SOCKET s;
     int ret;
+    BOOL sent = FALSE;
+    int log_error = 0;
+    int log_value = 0;
+    UINT send_count = 0;
 
+    EnterCriticalSection(&d->input_send_cs);
     s = d->input_socket;
-    if (s == INVALID_SOCKET) return;
+    if (s == INVALID_SOCKET) goto done;
 
     pkt.magic  = INPUT_MAGIC;
     pkt.type   = type;
@@ -664,33 +673,51 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
         if (err == WSAEWOULDBLOCK) {
             /* Send buffer full: drop this packet (as the comment intends)
                without tearing down the socket. */
-            return;
+            goto done;
         }
-        idd_log(d, L"INPUT SEND ERR %d - flagging for reconnect.", err);
+        log_error = 1;
+        log_value = err;
         /* Mark dead — recv thread owns the socket and will close + reconnect */
         d->input_socket = INVALID_SOCKET;
-        return;
+        goto done;
     }
     if (ret != (int)sizeof(pkt)) {
         /* Partial send on a stream socket: the guest reads fixed-size 20-byte
            InputPackets, so a truncated packet permanently misaligns the wire.
            Flag for reconnect so the channel resynchronises. */
-        idd_log(d, L"INPUT SEND short (%d/%d) - flagging for reconnect.",
-                ret, (int)sizeof(pkt));
+        log_error = 2;
+        log_value = ret;
         d->input_socket = INVALID_SOCKET;
-        return;
+        goto done;
     }
 
+    sent = TRUE;
     g_input_send_count++;
+    send_count = g_input_send_count;
 
-    /* Log non-move events only (moves are too noisy) */
-    if (type != INPUT_MOUSE_MOVE) {
+done:
+    LeaveCriticalSection(&d->input_send_cs);
+
+    /* Never synchronously message the UI-owned log window while holding the
+       stream lock (or a caller's frame lock). */
+    if (type == INPUT_FRAME_SIZE) {
+        /* FRAME_SIZE is sent while the caller holds frame_cs to order it
+           before mouse packets for the new framebuffer. That caller logs the
+           surrounding connection/resolution event after releasing frame_cs. */
+    } else if (log_error == 1) {
+        idd_log(d, L"INPUT SEND ERR %d - flagging for reconnect.", log_value);
+    } else if (log_error == 2) {
+        idd_log(d, L"INPUT SEND short (%d/%d) - flagging for reconnect.",
+                log_value, (int)sizeof(pkt));
+    } else if (sent && type != INPUT_MOUSE_MOVE) {
         static const wchar_t *type_names[] = {
-            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY"
+            L"MOUSE_MOVE", L"MOUSE_BTN", L"MOUSE_WHEEL", L"KEY", L"FRAME_SIZE"
         };
-        const wchar_t *name = type < 4 ? type_names[type] : L"?";
-        idd_log(d, L"INPUT %s p1=%u p2=%u p3=%u (#%u)", name, p1, p2, p3, g_input_send_count);
+        const wchar_t *name = type < 5 ? type_names[type] : L"?";
+        idd_log(d, L"INPUT %s p1=%u p2=%u p3=%u (#%u)",
+                name, p1, p2, p3, send_count);
     }
+    return sent;
 }
 
 /* ==================================================================
@@ -911,6 +938,19 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy,
     *vy = (UINT)local_y;
     if (*vx >= vm_w) *vx = vm_w - 1;
     if (*vy >= vm_h) *vy = vm_h - 1;
+}
+
+static UINT legacy_linux_input_coordinate(UINT coordinate, UINT frame_extent,
+                                          UINT legacy_extent)
+{
+    UINT64 scaled;
+
+    if (frame_extent <= 1 || legacy_extent == 0) return 0;
+    if (coordinate >= frame_extent - 1) return legacy_extent;
+    scaled = ((UINT64)coordinate * legacy_extent + (frame_extent - 1) / 2) /
+             (frame_extent - 1);
+    if (scaled > legacy_extent) scaled = legacy_extent;
+    return (UINT)scaled;
 }
 
 static BOOL frame_required_capacity(UINT32 width, UINT32 height, UINT32 stride,
@@ -1770,12 +1810,19 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             if (input_s != INVALID_SOCKET) {
                 UINT32 ready_magic = 0;
                 if (recv_exact(input_s, &ready_magic, sizeof(ready_magic)) &&
-                    ready_magic == INPUT_READY_MAGIC) {
+                    (ready_magic == INPUT_READY_MAGIC ||
+                     ready_magic == INPUT_READY_MAGIC_V2)) {
                     DWORD zero_timeout = 0;
                     u_long nb = 1;
                     setsockopt(input_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&zero_timeout, sizeof(zero_timeout));
                     ioctlsocket(input_s, FIONBIO, &nb);
+                    EnterCriticalSection(&d->frame_cs);
                     d->input_socket = input_s;
+                    d->input_frame_size_supported =
+                        ready_magic == INPUT_READY_MAGIC_V2;
+                    if (d->input_frame_size_supported)
+                        send_input(d, INPUT_FRAME_SIZE, d->frame_width, d->frame_height, 0);
+                    LeaveCriticalSection(&d->frame_cs);
                     g_input_send_count = 0;
                     idd_log(d, L"Input connected + ready (GUID :0003).");
                 } else {
@@ -1961,6 +2008,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->frame_width  = hdr.width;
                     d->frame_height = hdr.height;
                     d->frame_stride = new_stride;
+                    if (d->input_frame_size_supported)
+                        send_input(d, INPUT_FRAME_SIZE, hdr.width, hdr.height, 0);
                     idd_log(d, L"Frame resolution changed: %ux%u (stride=%u)",
                             hdr.width, hdr.height, hdr.stride);
                     idd_log(d, L"Resolution changed to %ux%u.", hdr.width, hdr.height);
@@ -2046,13 +2095,20 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 if (new_s != INVALID_SOCKET) {
                     UINT32 ready_magic = 0;
                     if (recv_exact(new_s, &ready_magic, sizeof(ready_magic)) &&
-                        ready_magic == INPUT_READY_MAGIC) {
+                        (ready_magic == INPUT_READY_MAGIC ||
+                         ready_magic == INPUT_READY_MAGIC_V2)) {
                         DWORD zero_timeout = 0;
                         u_long nb = 1;
                         setsockopt(new_s, SOL_SOCKET, SO_RCVTIMEO, (char *)&zero_timeout, sizeof(zero_timeout));
                         ioctlsocket(new_s, FIONBIO, &nb);
                         input_s = new_s;
+                        EnterCriticalSection(&d->frame_cs);
                         d->input_socket = new_s;
+                        d->input_frame_size_supported =
+                            ready_magic == INPUT_READY_MAGIC_V2;
+                        if (d->input_frame_size_supported)
+                            send_input(d, INPUT_FRAME_SIZE, d->frame_width, d->frame_height, 0);
+                        LeaveCriticalSection(&d->frame_cs);
                         g_input_send_count = 0;
                         idd_log(d, L"Input reconnected + ready (GUID :0003).");
                     } else {
@@ -2540,11 +2596,20 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             d->mouse_in = TRUE;
 
             {
-                UINT vx, vy;
+                UINT vx, vy, frame_width, frame_height;
+                EnterCriticalSection(&d->frame_cs);
+                frame_width = d->frame_width;
+                frame_height = d->frame_height;
                 /* lp coords are relative to render child */
                 window_to_vm_coords(d->render_hwnd,
                                     (int)(short)LOWORD(lp), (int)(short)HIWORD(lp),
-                                    d->frame_width, d->frame_height, &vx, &vy);
+                                    frame_width, frame_height, &vx, &vy);
+                if (!_wcsicmp(d->os_type, L"Linux") &&
+                    !d->input_frame_size_supported) {
+                    vx = legacy_linux_input_coordinate(vx, frame_width, DEFAULT_WIDTH);
+                    vy = legacy_linux_input_coordinate(vy, frame_height, DEFAULT_HEIGHT);
+                }
+                LeaveCriticalSection(&d->frame_cs);
                 send_input(d, INPUT_MOUSE_MOVE, vx, vy, 0);
             }
         }
@@ -2671,6 +2736,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     }
 
     InitializeCriticalSection(&d->frame_cs);
+    InitializeCriticalSection(&d->input_send_cs);
     InitializeCriticalSection(&d->resize_cs);
     InitializeCriticalSection(&d->agent_command_cs);
 
@@ -2678,6 +2744,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     if (!d->resize_event) {
         DeleteCriticalSection(&d->agent_command_cs);
         DeleteCriticalSection(&d->resize_cs);
+        DeleteCriticalSection(&d->input_send_cs);
         DeleteCriticalSection(&d->frame_cs);
         HeapFree(GetProcessHeap(), 0, d->frame_buf);
         HeapFree(GetProcessHeap(), 0, d);
@@ -2689,6 +2756,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
         CloseHandle(d->resize_event);
         DeleteCriticalSection(&d->agent_command_cs);
         DeleteCriticalSection(&d->resize_cs);
+        DeleteCriticalSection(&d->input_send_cs);
         DeleteCriticalSection(&d->frame_cs);
         HeapFree(GetProcessHeap(), 0, d->frame_buf);
         HeapFree(GetProcessHeap(), 0, d);
@@ -2706,6 +2774,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
         CloseHandle(d->resize_event);
         DeleteCriticalSection(&d->agent_command_cs);
         DeleteCriticalSection(&d->resize_cs);
+        DeleteCriticalSection(&d->input_send_cs);
         DeleteCriticalSection(&d->frame_cs);
         HeapFree(GetProcessHeap(), 0, d->frame_buf);
         HeapFree(GetProcessHeap(), 0, d);
@@ -2780,6 +2849,7 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
 
     DeleteCriticalSection(&display->agent_command_cs);
     DeleteCriticalSection(&display->resize_cs);
+    DeleteCriticalSection(&display->input_send_cs);
     DeleteCriticalSection(&display->frame_cs);
 
     if (display->clipboard) {

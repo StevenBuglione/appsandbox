@@ -30,3 +30,11 @@ The `linguum` branch contains only the dynamic Windows/Linux display-sizing POC.
 - Temporary exact-mode application after the virtual KMS hotplug
 - Exact arbitrary-width virtual modes without CVT's eight-pixel rounding
 - Per-monitor DPI changes and full-display client tracking limits
+
+## LINGUUM-006 — Dynamic Linux pointer calibration
+
+- Versioned framebuffer-size hints on the existing input channel
+- Exact absolute-pointer mapping across arbitrary viewer sizes
+- Backward-compatible host normalization for previously installed Linux agents
+- Serialized input packets during reconnect and resize transitions
+- Focused edge, midpoint, and frame-size validation tests
