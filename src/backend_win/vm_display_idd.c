@@ -102,8 +102,12 @@ typedef struct AudioFrameHeader {
 #define FRAME_MAGIC         0x52465341  /* "ASFR" little-endian */
 #define DEFAULT_WIDTH       1920
 #define DEFAULT_HEIGHT      1080
+#define MIN_FRAME_WIDTH     64
+#define MIN_FRAME_HEIGHT    64
+#define MAX_FRAME_WIDTH     7680
+#define MAX_FRAME_HEIGHT    4320
+#define MAX_FRAME_STRIDE    (MAX_FRAME_WIDTH * 4)
 #define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
 
 /* ---- Input protocol (host → guest) ---- */
 
@@ -218,6 +222,8 @@ struct VmDisplayIdd {
     ID3D11RenderTargetView  *rtv;
     ID3D11Texture2D         *frame_tex;
     ID3D11ShaderResourceView *frame_srv;
+    UINT                     frame_tex_width;
+    UINT                     frame_tex_height;
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
     ID3D11SamplerState      *sampler;
@@ -712,6 +718,11 @@ static void compute_letterbox(UINT client_w, UINT client_h,
         *out_x = 0; *out_y = 0; *out_w = 0; *out_h = 0;
         return;
     }
+    if (client_w == frame_w && client_h == frame_h) {
+        *out_x = 0; *out_y = 0;
+        *out_w = (float)client_w; *out_h = (float)client_h;
+        return;
+    }
     scale_x = (float)client_w / (float)frame_w;
     scale_y = (float)client_h / (float)frame_h;
     scale = scale_x < scale_y ? scale_x : scale_y;
@@ -749,6 +760,28 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy,
     *vy = (UINT)local_y;
     if (*vx >= vm_w) *vx = vm_w - 1;
     if (*vy >= vm_h) *vy = vm_h - 1;
+}
+
+static BOOL frame_required_capacity(UINT32 width, UINT32 height, UINT32 stride,
+                                    SIZE_T *capacity_out)
+{
+    SIZE_T capacity;
+
+    if (!capacity_out ||
+        width < MIN_FRAME_WIDTH || height < MIN_FRAME_HEIGHT ||
+        width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT ||
+        stride < width * 4 || stride > MAX_FRAME_STRIDE)
+        return FALSE;
+
+    if ((SIZE_T)height > ((SIZE_T)-1) / (SIZE_T)stride)
+        return FALSE;
+
+    capacity = (SIZE_T)stride * (SIZE_T)height;
+    if (capacity > (SIZE_T)MAX_FRAME_STRIDE * (SIZE_T)MAX_FRAME_HEIGHT)
+        return FALSE;
+
+    *capacity_out = capacity;
+    return TRUE;
 }
 
 /* ---- Reliable recv: read exactly `len` bytes ---- */
@@ -1046,12 +1079,72 @@ static BOOL d3d_compile_shader(const char *hlsl, const char *entry,
     return TRUE;
 }
 
+static BOOL d3d_ensure_frame_texture(VmDisplayIdd *d, UINT width, UINT height)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    ID3D11Texture2D *new_tex = NULL;
+    ID3D11ShaderResourceView *new_srv = NULL;
+    HRESULT hr;
+
+    if (!d->device || width < MIN_FRAME_WIDTH || height < MIN_FRAME_HEIGHT ||
+        width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
+        return FALSE;
+
+    if (d->frame_tex && d->frame_srv &&
+        d->frame_tex_width == width && d->frame_tex_height == height)
+        return TRUE;
+
+    ZeroMemory(&td, sizeof(td));
+    td.Width              = width;
+    td.Height             = height;
+    td.MipLevels          = 1;
+    td.ArraySize          = 1;
+    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count   = 1;
+    td.Usage              = D3D11_USAGE_DYNAMIC;
+    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
+
+    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &new_tex);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateTexture2D %ux%u failed (0x%08X)", width, height, hr);
+        return FALSE;
+    }
+
+    ZeroMemory(&srv_desc, sizeof(srv_desc));
+    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels       = 1;
+    srv_desc.Texture2D.MostDetailedMip = 0;
+
+    hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
+            (ID3D11Resource *)new_tex, &srv_desc, &new_srv);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateShaderResourceView %ux%u failed (0x%08X)", width, height, hr);
+        new_tex->lpVtbl->Release(new_tex);
+        return FALSE;
+    }
+
+    if (d->ctx && d->frame_srv) {
+        ID3D11ShaderResourceView *null_srv = NULL;
+        d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 1, &null_srv);
+    }
+    if (d->frame_srv) d->frame_srv->lpVtbl->Release(d->frame_srv);
+    if (d->frame_tex) d->frame_tex->lpVtbl->Release(d->frame_tex);
+
+    d->frame_tex = new_tex;
+    d->frame_srv = new_srv;
+    d->frame_tex_width = width;
+    d->frame_tex_height = height;
+    idd_log(d, L"D3D frame texture changed to %ux%u.", width, height);
+    return TRUE;
+}
+
 static BOOL d3d_init(VmDisplayIdd *d)
 {
     DXGI_SWAP_CHAIN_DESC scd;
     D3D_FEATURE_LEVEL feature_level;
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
     D3D11_SAMPLER_DESC sd;
     ID3DBlob *vs_blob = NULL;
     ID3DBlob *ps_blob = NULL;
@@ -1099,35 +1192,8 @@ static BOOL d3d_init(VmDisplayIdd *d)
         }
     }
 
-    /* Create frame texture (dynamic, CPU-writable) */
-    ZeroMemory(&td, sizeof(td));
-    td.Width              = DEFAULT_WIDTH;
-    td.Height             = DEFAULT_HEIGHT;
-    td.MipLevels          = 1;
-    td.ArraySize          = 1;
-    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count   = 1;
-    td.Usage              = D3D11_USAGE_DYNAMIC;
-    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
-    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
-
-    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->frame_tex);
-    if (FAILED(hr)) {
-        ui_log(L"IDD: CreateTexture2D failed (0x%08X)", hr);
-        return FALSE;
-    }
-
-    /* Shader resource view for the frame texture */
-    ZeroMemory(&srv_desc, sizeof(srv_desc));
-    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
-    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srv_desc.Texture2D.MipLevels       = 1;
-    srv_desc.Texture2D.MostDetailedMip = 0;
-
-    hr = d->device->lpVtbl->CreateShaderResourceView(d->device,
-            (ID3D11Resource *)d->frame_tex, &srv_desc, &d->frame_srv);
-    if (FAILED(hr)) {
-        ui_log(L"IDD: CreateShaderResourceView failed (0x%08X)", hr);
+    if (!d3d_ensure_frame_texture(d, d->frame_width, d->frame_height)) {
+        ui_log(L"IDD: Failed to create initial frame texture.");
         return FALSE;
     }
 
@@ -1227,6 +1293,10 @@ static void d3d_render_frame(VmDisplayIdd *d)
     /* Upload frame data to GPU texture if dirty */
     if (d->frame_dirty) {
         EnterCriticalSection(&d->frame_cs);
+        if (!d3d_ensure_frame_texture(d, d->frame_width, d->frame_height)) {
+            LeaveCriticalSection(&d->frame_cs);
+            return;
+        }
         hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
                 D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1238,17 +1308,17 @@ static void d3d_render_frame(VmDisplayIdd *d)
             if (copy_stride > d->frame_stride)
                 copy_stride = d->frame_stride;
 
-            for (row = 0; row < d->frame_height && row < DEFAULT_HEIGHT; row++) {
+            for (row = 0; row < d->frame_height; row++) {
                 memcpy((BYTE *)mapped.pData + row * mapped.RowPitch,
                        d->frame_buf + row * d->frame_stride,
                        copy_stride);
             }
             d->ctx->lpVtbl->Unmap(d->ctx,
                     (ID3D11Resource *)d->frame_tex, 0);
+            d->frame_dirty = FALSE;
+            frame_uploaded = TRUE;
         }
-        d->frame_dirty = FALSE;
         LeaveCriticalSection(&d->frame_cs);
-        frame_uploaded = TRUE;
     }
 
     /* Compute letterboxed viewport within client area */
@@ -1302,6 +1372,8 @@ static void d3d_cleanup(VmDisplayIdd *d)
     if (d->vs)         { d->vs->lpVtbl->Release(d->vs);                 d->vs = NULL; }
     if (d->frame_srv)  { d->frame_srv->lpVtbl->Release(d->frame_srv);   d->frame_srv = NULL; }
     if (d->frame_tex)  { d->frame_tex->lpVtbl->Release(d->frame_tex);   d->frame_tex = NULL; }
+    d->frame_tex_width = 0;
+    d->frame_tex_height = 0;
     if (d->rtv)        { d->rtv->lpVtbl->Release(d->rtv);               d->rtv = NULL; }
     if (d->swap_chain) { d->swap_chain->lpVtbl->Release(d->swap_chain); d->swap_chain = NULL; }
     if (d->ctx)        { d->ctx->lpVtbl->Release(d->ctx);               d->ctx = NULL; }
@@ -1520,15 +1592,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     WSADATA wsa;
     BYTE *recv_buf = NULL;
+    SIZE_T recv_capacity = 0;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
-
-    /* Allocate receive buffer for frame pixel data */
-    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MAX_FRAME_DATA_SIZE);
-    if (!recv_buf) {
-        ui_log(L"IDD recv: failed to allocate receive buffer");
-        return 1;
-    }
 
     /* Tell the agent to respawn input helper in console session */
     if (!d->stop && d->vm && d->vm->agent_online) {
@@ -1607,6 +1673,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             UINT32 rect_count;
             UINT32 i;
             UINT32 magic;
+            SIZE_T required_capacity;
 
             /* Peek at magic to determine message type */
             if (!recv_exact(s, &magic, sizeof(magic)))
@@ -1674,12 +1741,29 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 break;
 
             /* Sanity checks */
-            if (hdr.width == 0 || hdr.height == 0 ||
-                hdr.width > 7680 || hdr.height > 4320 ||
-                hdr.stride < hdr.width * 4) {
+            if (!frame_required_capacity(hdr.width, hdr.height, hdr.stride,
+                                         &required_capacity)) {
                 idd_log(d, L"Invalid frame dimensions %ux%u stride %u.",
                        hdr.width, hdr.height, hdr.stride);
                 break;
+            }
+
+            if (required_capacity > recv_capacity) {
+                BYTE *new_recv_buf;
+                if (recv_buf) {
+                    new_recv_buf = (BYTE *)HeapReAlloc(GetProcessHeap(), 0,
+                                                       recv_buf, required_capacity);
+                } else {
+                    new_recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0,
+                                                     required_capacity);
+                }
+                if (!new_recv_buf) {
+                    idd_log(d, L"Failed to allocate %llu-byte frame receive buffer.",
+                            (unsigned long long)required_capacity);
+                    break;
+                }
+                recv_buf = new_recv_buf;
+                recv_capacity = required_capacity;
             }
 
             rect_count = hdr.dirty_rect_count;
@@ -1698,8 +1782,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             if (!recv_exact(s, &data_size, 4))
                 break;
 
-            if (data_size > MAX_FRAME_DATA_SIZE) {
-                idd_log(d, L"Frame data too large (%u bytes), reconnecting.", data_size);
+            if ((SIZE_T)data_size > required_capacity) {
+                idd_log(d, L"Frame data too large (%u > %llu bytes), reconnecting.",
+                        data_size, (unsigned long long)required_capacity);
                 break;
             }
 
@@ -1715,7 +1800,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             /* Reallocate frame_buf if resolution changed */
             if (hdr.width != d->frame_width || hdr.height != d->frame_height) {
                 UINT new_stride = hdr.width * 4;
-                UINT new_size   = new_stride * hdr.height;
+                SIZE_T new_size = (SIZE_T)new_stride * (SIZE_T)hdr.height;
                 BYTE *new_buf   = (BYTE *)HeapAlloc(GetProcessHeap(),
                                                      HEAP_ZERO_MEMORY, new_size);
                 if (new_buf) {
@@ -2162,14 +2247,6 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
         mmi->ptMinTrackSize.x = wr.right - wr.left;
         mmi->ptMinTrackSize.y = wr.bottom - wr.top;
-        /* Max: native frame size */
-        if (d && d->frame_width > 0 && d->frame_height > 0) {
-            wr.left = 0; wr.top = 0;
-            wr.right = (LONG)d->frame_width; wr.bottom = (LONG)d->frame_height;
-            AdjustWindowRectEx(&wr, style, FALSE, exstyle);
-            mmi->ptMaxTrackSize.x = wr.right - wr.left;
-            mmi->ptMaxTrackSize.y = wr.bottom - wr.top;
-        }
         return 0;
     }
 
@@ -2480,7 +2557,11 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
 BOOL vm_display_idd_is_open(VmDisplayIdd *display)
 {
     if (!display) return FALSE;
-    return display->open && display->hwnd && IsWindow(display->hwnd);
+    /* open is set before the window thread starts and cleared on every close or
+       creation failure. Treat that short startup interval as open so status
+       polling cannot reap and free this context before the thread publishes
+       its HWND. */
+    return display->open;
 }
 
 void vm_display_idd_focus(VmDisplayIdd *display)
