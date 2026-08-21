@@ -143,6 +143,8 @@ typedef struct InputPacket {
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
 #define PRESENT_MS      16   /* ~60 fps */
+#define IDT_RESIZE_DEBOUNCE 2002
+#define RESIZE_DEBOUNCE_MS  33
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -236,6 +238,22 @@ struct VmDisplayIdd {
     CRITICAL_SECTION frame_cs;
     volatile BOOL  frame_dirty;
 
+    /* Host -> guest display sizing. The window thread only publishes the
+       latest physical client size; the worker performs the blocking agent RPC. */
+    CRITICAL_SECTION resize_cs;
+    CRITICAL_SECTION agent_command_cs;
+    HANDLE         resize_event;
+    HANDLE         resize_thread;
+    UINT           desired_guest_width;
+    UINT           desired_guest_height;
+    UINT           pending_resize_width;
+    UINT           pending_resize_height;
+    UINT           last_requested_width;
+    UINT           last_requested_height;
+    UINT           last_applied_width;
+    UINT           last_applied_height;
+    BOOL           resize_pending;
+
     UINT           render_count;     /* number of renders (for one-shot logging) */
     volatile UINT  recv_count;       /* number of frames received over HvSocket */
 
@@ -284,6 +302,7 @@ struct VmDisplayIdd {
 static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static DWORD WINAPI     idd_window_thread_proc(LPVOID param);
 static DWORD WINAPI     idd_recv_thread_proc(LPVOID param);
+static DWORD WINAPI     idd_resize_thread_proc(LPVOID param);
 
 /* ---- Window class ---- */
 
@@ -485,6 +504,138 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
     /* Scroll to bottom and force repaint even when not focused */
     SendMessageW(d->log_list_hwnd, LB_SETTOPINDEX, (WPARAM)(count - 1), 0);
     UpdateWindow(d->log_list_hwnd);
+}
+
+static BOOL idd_agent_send(VmDisplayIdd *d, const char *command,
+                           char *response, int response_max, DWORD timeout_ms)
+{
+    BOOL ok;
+
+    EnterCriticalSection(&d->agent_command_cs);
+    ok = !d->stop && d->vm &&
+         vm_agent_send(d->vm, command, response, response_max, timeout_ms);
+    LeaveCriticalSection(&d->agent_command_cs);
+    return ok;
+}
+
+static void idd_update_desired_resize(VmDisplayIdd *d, HWND hwnd)
+{
+    RECT rc;
+    UINT width, height;
+    BOOL changed = FALSE;
+
+    if (!d || !hwnd || !GetClientRect(hwnd, &rc)) return;
+    width = (UINT)rc.right;
+    height = (UINT)rc.bottom;
+    if (width < MIN_FRAME_WIDTH || height < MIN_FRAME_HEIGHT ||
+        width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
+        return;
+
+    EnterCriticalSection(&d->resize_cs);
+    if (d->desired_guest_width != width || d->desired_guest_height != height) {
+        d->desired_guest_width = width;
+        d->desired_guest_height = height;
+        changed = TRUE;
+    }
+    LeaveCriticalSection(&d->resize_cs);
+
+    if (changed)
+        idd_log(d, L"Host target: %ux%u physical client pixels.", width, height);
+}
+
+static void idd_queue_desired_resize(VmDisplayIdd *d)
+{
+    BOOL queued = FALSE;
+
+    if (!d || d->stop) return;
+
+    EnterCriticalSection(&d->resize_cs);
+    if (d->desired_guest_width >= MIN_FRAME_WIDTH &&
+        d->desired_guest_height >= MIN_FRAME_HEIGHT &&
+        (d->desired_guest_width != d->last_requested_width ||
+         d->desired_guest_height != d->last_requested_height)) {
+        d->pending_resize_width = d->desired_guest_width;
+        d->pending_resize_height = d->desired_guest_height;
+        d->resize_pending = TRUE;
+        queued = TRUE;
+    }
+    LeaveCriticalSection(&d->resize_cs);
+
+    if (queued) SetEvent(d->resize_event);
+}
+
+static void idd_note_applied_frame(VmDisplayIdd *d, UINT width, UINT height)
+{
+    UINT desired_width, desired_height;
+    BOOL changed = FALSE;
+
+    EnterCriticalSection(&d->resize_cs);
+    desired_width = d->desired_guest_width;
+    desired_height = d->desired_guest_height;
+    if (d->last_applied_width != width || d->last_applied_height != height) {
+        d->last_applied_width = width;
+        d->last_applied_height = height;
+        changed = TRUE;
+    }
+    LeaveCriticalSection(&d->resize_cs);
+
+    if (changed) {
+        idd_log(d, L"Frame received: %ux%u.", width, height);
+        if (width == desired_width && height == desired_height)
+            idd_log(d, L"Resize settled at exact 1:1 size %ux%u.", width, height);
+    }
+}
+
+static DWORD WINAPI idd_resize_thread_proc(LPVOID param)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)param;
+
+    while (!d->stop) {
+        DWORD wait_result = WaitForSingleObject(d->resize_event, INFINITE);
+        if (wait_result != WAIT_OBJECT_0 || d->stop) break;
+
+        for (;;) {
+            UINT width = 0, height = 0;
+            char command[64];
+            char response[256] = { 0 };
+            BOOL ok;
+
+            EnterCriticalSection(&d->resize_cs);
+            if (d->resize_pending) {
+                width = d->pending_resize_width;
+                height = d->pending_resize_height;
+                d->resize_pending = FALSE;
+                if (width == d->last_requested_width &&
+                    height == d->last_requested_height) {
+                    width = 0;
+                    height = 0;
+                } else {
+                    d->last_requested_width = width;
+                    d->last_requested_height = height;
+                }
+            }
+            LeaveCriticalSection(&d->resize_cs);
+
+            if (!width || !height || d->stop) break;
+
+            sprintf_s(command, sizeof(command), "display_resize:%ux%u@60",
+                      width, height);
+            ok = idd_agent_send(d, command, response, sizeof(response), 5000);
+            if (ok) {
+                idd_log(d, L"Guest requested: %ux%u@60 (accepted).", width, height);
+            } else {
+                idd_log(d, L"Guest requested: %ux%u@60 (rejected: %S).",
+                        width, height, response[0] ? response : "no response");
+            }
+
+            EnterCriticalSection(&d->resize_cs);
+            ok = d->resize_pending;
+            LeaveCriticalSection(&d->resize_cs);
+            if (!ok) break;
+        }
+    }
+
+    return 0;
 }
 
 /* ---- Send input packet to guest ---- */
@@ -1599,7 +1750,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     /* Tell the agent to respawn input helper in console session */
     if (!d->stop && d->vm && d->vm->agent_online) {
         idd_log(d, L"Sending idd_connect to agent...");
-        vm_agent_send(d->vm, "idd_connect", NULL, 0, 5000);
+        idd_agent_send(d, "idd_connect", NULL, 0, 5000);
     }
 
     /* Input socket lives independently of the frame channel — survives
@@ -1877,6 +2028,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             d->frame_dirty = TRUE;
             d->recv_count++;
             LeaveCriticalSection(&d->frame_cs);
+            idd_note_applied_frame(d, hdr.width, hdr.height);
 
             /* Signal the window thread to repaint */
             if (d->hwnd && IsWindow(d->hwnd))
@@ -2179,6 +2331,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             /* Stop recv threads */
             d->stop = TRUE;
+            KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
+            if (d->resize_event) SetEvent(d->resize_event);
+
+            if (d->resize_thread) {
+                WaitForSingleObject(d->resize_thread, INFINITE);
+                CloseHandle(d->resize_thread);
+                d->resize_thread = NULL;
+            }
 
             /* Destroy clipboard module */
             if (d->clipboard) {
@@ -2257,6 +2417,18 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
             d3d_resize_swap_chain(d);
+            if (wp != SIZE_MINIMIZED) {
+                idd_update_desired_resize(d, hwnd);
+                SetTimer(hwnd, IDT_RESIZE_DEBOUNCE, RESIZE_DEBOUNCE_MS, NULL);
+            }
+        }
+        return 0;
+
+    case WM_EXITSIZEMOVE:
+        if (d) {
+            KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
+            idd_update_desired_resize(d, hwnd);
+            idd_queue_desired_resize(d);
         }
         return 0;
 
@@ -2273,6 +2445,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == IDT_PRESENT && d) {
             if (d->frame_dirty)
                 d3d_render_frame(d);
+        } else if (wp == IDT_RESIZE_DEBOUNCE && d) {
+            KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
+            idd_queue_desired_resize(d);
         }
         return 0;
 
@@ -2476,11 +2651,41 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     }
 
     InitializeCriticalSection(&d->frame_cs);
+    InitializeCriticalSection(&d->resize_cs);
+    InitializeCriticalSection(&d->agent_command_cs);
+
+    d->resize_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!d->resize_event) {
+        DeleteCriticalSection(&d->agent_command_cs);
+        DeleteCriticalSection(&d->resize_cs);
+        DeleteCriticalSection(&d->frame_cs);
+        HeapFree(GetProcessHeap(), 0, d->frame_buf);
+        HeapFree(GetProcessHeap(), 0, d);
+        return NULL;
+    }
+
+    d->resize_thread = CreateThread(NULL, 0, idd_resize_thread_proc, d, 0, NULL);
+    if (!d->resize_thread) {
+        CloseHandle(d->resize_event);
+        DeleteCriticalSection(&d->agent_command_cs);
+        DeleteCriticalSection(&d->resize_cs);
+        DeleteCriticalSection(&d->frame_cs);
+        HeapFree(GetProcessHeap(), 0, d->frame_buf);
+        HeapFree(GetProcessHeap(), 0, d);
+        return NULL;
+    }
 
     /* Start the window thread (which will then start the recv thread) */
     d->window_thread = CreateThread(NULL, 0, idd_window_thread_proc, d, 0, NULL);
     if (!d->window_thread) {
         ui_log(L"IDD: Failed to create window thread.");
+        d->stop = TRUE;
+        SetEvent(d->resize_event);
+        WaitForSingleObject(d->resize_thread, INFINITE);
+        CloseHandle(d->resize_thread);
+        CloseHandle(d->resize_event);
+        DeleteCriticalSection(&d->agent_command_cs);
+        DeleteCriticalSection(&d->resize_cs);
         DeleteCriticalSection(&d->frame_cs);
         HeapFree(GetProcessHeap(), 0, d->frame_buf);
         HeapFree(GetProcessHeap(), 0, d);
@@ -2497,6 +2702,7 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     /* Signal stop */
     display->stop = TRUE;
     display->open = FALSE;
+    if (display->resize_event) SetEvent(display->resize_event);
 
     /* Close the window to unblock the message pump */
     if (display->hwnd && IsWindow(display->hwnd))
@@ -2525,6 +2731,17 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
         CloseHandle(display->recv_thread);
     }
 
+    if (display->resize_thread) {
+        WaitForSingleObject(display->resize_thread, INFINITE);
+        CloseHandle(display->resize_thread);
+        display->resize_thread = NULL;
+    }
+
+    if (display->resize_event) {
+        CloseHandle(display->resize_event);
+        display->resize_event = NULL;
+    }
+
     /* Clipboard is cleaned up by WM_CLOSE handler, but guard */
     if (display->clipboard) {
         vm_clipboard_destroy(display->clipboard);
@@ -2541,6 +2758,8 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
         CloseHandle(display->audio_recv_thread);
     }
 
+    DeleteCriticalSection(&display->agent_command_cs);
+    DeleteCriticalSection(&display->resize_cs);
     DeleteCriticalSection(&display->frame_cs);
 
     if (display->clipboard) {
