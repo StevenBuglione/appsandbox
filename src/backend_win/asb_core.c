@@ -2613,6 +2613,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     BOOL is_template_create;
     int template_idx = -1;
     BOOL from_template = FALSE;
+    BOOL from_prebuilt_disk = FALSE;
+    wchar_t prebuilt_disk_path[MAX_PATH] = { 0 };
 
     if (!config || !config->name || config->name[0] == L'\0') {
         asb_log(L"Error: VM name is required.");
@@ -2625,6 +2627,24 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     wcscpy_s(cfg.name, 256, config->name);
     if (config->os_type) wcscpy_s(cfg.os_type, 32, config->os_type);
     if (config->image_path) wcscpy_s(cfg.image_path, MAX_PATH, config->image_path);
+    if (config->disk_path && config->disk_path[0] != L'\0') {
+        DWORD attrs;
+        DWORD path_length;
+        const wchar_t *extension;
+        path_length = GetFullPathNameW(config->disk_path, MAX_PATH, prebuilt_disk_path, NULL);
+        if (path_length == 0 || path_length >= MAX_PATH) {
+            asb_log(L"Error: Invalid prebuilt disk path.");
+            return E_INVALIDARG;
+        }
+        attrs = GetFileAttributesW(prebuilt_disk_path);
+        extension = wcsrchr(prebuilt_disk_path, L'.');
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) ||
+            !extension || _wcsicmp(extension, L".vhdx") != 0) {
+            asb_log(L"Error: Prebuilt disk must be an existing .vhdx file.");
+            return E_INVALIDARG;
+        }
+        from_prebuilt_disk = TRUE;
+    }
     if (config->username) wcscpy_s(cfg.admin_user, 128, config->username);
     if (config->password) wcscpy_s(cfg.admin_pass, 128, config->password);
     cfg.ram_mb = config->ram_mb;
@@ -2675,7 +2695,16 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         return E_INVALIDARG;
     }
 
-    /* Linux v1: require an ISO. Templates aren't supported for Linux yet. */
+    if (from_prebuilt_disk && _wcsicmp(cfg.os_type, L"Linux") != 0) {
+        asb_log(L"Error: Prebuilt disks are supported only for Linux VMs.");
+        return E_INVALIDARG;
+    }
+    if (from_prebuilt_disk && (from_template || cfg.image_path[0] != L'\0')) {
+        asb_log(L"Error: Prebuilt disk cannot be combined with an ISO or template.");
+        return E_INVALIDARG;
+    }
+
+    /* Linux v1: require an ISO or a prebuilt appliance disk. */
     if (_wcsicmp(cfg.os_type, L"Linux") == 0) {
         if (is_template_create) {
             asb_log(L"Error: Linux templates are not supported.");
@@ -2685,8 +2714,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             asb_log(L"Error: Linux cannot be created from a template.");
             return E_INVALIDARG;
         }
-        if (cfg.image_path[0] == L'\0') {
-            asb_log(L"Error: Linux requires an ISO path.");
+        if (cfg.image_path[0] == L'\0' && !from_prebuilt_disk) {
+            asb_log(L"Error: Linux requires an ISO or prebuilt disk path.");
             return E_INVALIDARG;
         }
     }
@@ -2842,7 +2871,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         /* image_path is the Ubuntu Desktop installer ISO the user picked;
            the VHDX is built from it on the host. admin_pass flows through
            to the guest's firstboot as a $6$ hash (see linux_create_thread). */
-        BOOL use_linux_cloud = (!from_template && !is_template_create &&
+        BOOL use_linux_cloud = (!from_template && !from_prebuilt_disk && !is_template_create &&
                                 _wcsicmp(cfg.os_type, L"Linux") == 0 &&
                                 cfg.image_path[0] != L'\0');
 
@@ -2912,10 +2941,30 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     /* Populate name early so log lines (e.g. NAT IP allocation) identify the VM. */
     wcscpy_s(inst->name, 256, cfg.name);
 
-    /* Create disk (synchronous path: from-template only — Linux ISO
-       creates go through the use_linux_cloud branch above; Windows ISO
-       installs go through use_vhdx_first above). */
-    if (from_template) {
+    /* Importing a prebuilt appliance changes only the disk source. The HCS,
+       networking, GPU-PV, Plan9, HvSocket, display, and lifecycle path below
+       remains identical to every other Linux VM. */
+    if (from_prebuilt_disk) {
+        DWORD imported_attrs;
+        asb_log(L"Importing prebuilt Linux disk: %s", prebuilt_disk_path);
+        if (!CopyFileW(prebuilt_disk_path, cfg.vhdx_path, TRUE)) {
+            DWORD copy_error = GetLastError();
+            asb_log(L"Error: Failed to import prebuilt disk (Win32 %lu).", copy_error);
+            return HRESULT_FROM_WIN32(copy_error);
+        }
+        imported_attrs = GetFileAttributesW(cfg.vhdx_path);
+        if (imported_attrs == INVALID_FILE_ATTRIBUTES ||
+            !SetFileAttributesW(cfg.vhdx_path,
+                (imported_attrs & ~FILE_ATTRIBUTE_READONLY) != 0
+                    ? imported_attrs & ~FILE_ATTRIBUTE_READONLY
+                    : FILE_ATTRIBUTE_NORMAL)) {
+            DWORD attr_error = GetLastError();
+            asb_log(L"Error: Failed to make the imported disk writable (Win32 %lu).", attr_error);
+            DeleteFileW(cfg.vhdx_path);
+            return HRESULT_FROM_WIN32(attr_error);
+        }
+        asb_log(L"Prebuilt Linux disk imported.");
+    } else if (from_template) {
         asb_log(L"Creating differencing VHDX from template \"%s\"...", g_templates[template_idx].name);
         DeleteFileW(cfg.vhdx_path);
         hr = vhdx_create_differencing(cfg.vhdx_path, g_templates[template_idx].vhdx_path);
@@ -3024,6 +3073,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             hcn_delete_endpoint(&inst->endpoint_id);
             endpoint_guid_str[0] = L'\0';
         }
+        if (from_prebuilt_disk)
+            DeleteFileW(cfg.vhdx_path);
         return hr;
     }
 
@@ -3038,10 +3089,11 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
     { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
       snapshot_init(&g_snap_trees[g_vm_count], sd); }
+    inst->install_complete = from_prebuilt_disk;
     g_vm_count++;
 
     if (!is_template_create)
-        vm_save_state_json(cfg.vhdx_path, FALSE);
+        vm_save_state_json(cfg.vhdx_path, from_prebuilt_disk);
 
     /* Auto-start */
     asb_log(L"Starting VM \"%s\"...", cfg.name);

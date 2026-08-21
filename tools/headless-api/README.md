@@ -77,7 +77,8 @@ in create-validation (wrong `osType` → `400`); the host-feature row mirrors
 | Display window (`/vms/{n}/display`) | ✅ | ✅ (daemon in a console GUI session) |
 | GPU, NAT/network modes, SSH server, SSH-key auto-deploy, SSE events | ✅ | ✅ |
 
-Only `snapshots`/`templates` are advertised in the `capabilities` object; guest
+Snapshots, templates, and prebuilt Linux disks are advertised in the
+`capabilities` object; guest
 OS is host-fixed (Windows host → Windows + Linux; macOS host → macOS + Windows), so
 a client picks its `osType` from `version()["hostOs"]`, not from `capabilities`.
 
@@ -204,6 +205,12 @@ gpuMode, networkMode, displayOpen`.
 | `delete_vm(name)` | remove the VM and its disk (refused 409 while building) |
 | `delete_template(name)` | remove a template |
 | `shutdown_daemon(force=False)` | stop the daemon (refused 409 if VMs are active unless `force=True`) |
+
+`create()` also accepts `diskPath` for a prebuilt Linux `.vhdx`. Pass
+`install=false`; App Sandbox copies the appliance into the VM's private data
+directory and skips ISO installation while retaining the normal HCS, GPU-PV,
+Plan9, HvSocket, display, input, clipboard, audio, snapshot, and cleanup paths.
+`diskPath` cannot be combined with `imagePath` or `templateName`.
 
 ### Snapshots & branches *(return `(status, body)`)*
 | Method | Effect |

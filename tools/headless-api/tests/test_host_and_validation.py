@@ -60,6 +60,8 @@ v = c.version()
 check("version product == AppSandbox", v.get("product") == "AppSandbox")
 caps = v.get("capabilities", {})
 check("capabilities advertised", isinstance(caps.get("snapshots"), bool) and isinstance(caps.get("templates"), bool), "%s" % caps)
+if not IS_MAC:
+    check("prebuilt Linux disk capability advertised", caps.get("prebuiltLinuxDisk") is True, "%s" % caps)
 if caps.get("templates"):
     check("templates is a list", isinstance(c.templates(), list))
 else:
@@ -106,6 +108,10 @@ else:
         ("Windows reserved username", dict(WIN, name="okwin", adminUser="CON"),    "reserved"),
         ("Windows username > 20",     dict(WIN, name="okwin", adminUser="a" * 21),  "20 characters"),
         ("Linux empty password",      dict(LIN, name="oklin", adminUser="user", adminPass=""), "Password is required"),
+        ("prebuilt disk needs install=false", dict(osType="Linux", name="oklin", diskPath="x.vhdx"), "install=false"),
+        ("prebuilt disk rejects install=true", dict(osType="Linux", name="oklin", diskPath="x.vhdx", install=True), "install=false"),
+        ("prebuilt disk is Linux-only", dict(osType="Windows", name="okwin", diskPath="x.vhdx", install=False), "only for Linux"),
+        ("prebuilt disk rejects ISO", dict(LIN, name="oklin", diskPath="x.vhdx", install=False), "cannot be combined"),
         ("odd RAM",                   dict(WIN, name="okwin", ramMb=4001),         "2 MB-aligned"),
         ("RAM < 512",                 dict(WIN, name="okwin", ramMb=256),          "at least 512"),
         ("gpuMode out of range",      dict(WIN, name="okwin", gpuMode=9),          "gpuMode"),

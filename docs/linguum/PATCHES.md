@@ -38,3 +38,11 @@ The `linguum` branch contains only the dynamic Windows/Linux display-sizing POC.
 - Backward-compatible host normalization for previously installed Linux agents
 - Serialized input packets during reconnect and resize transitions
 - Focused edge, midpoint, and frame-size validation tests
+
+## LINGUUM-007 — Prebuilt Linux appliance import
+
+- Headless `diskPath` plus `install=false` creation interface
+- Strict Linux-only, existing-VHDX validation
+- Process-owned copy into the VM's private ProgramData directory
+- Reuse of the existing HCS, GPU-PV, Plan9, HvSocket, display, input, audio,
+  snapshot, and process-exact cleanup paths

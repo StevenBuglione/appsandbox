@@ -109,12 +109,14 @@ class Client:
     def delete_vm(self, name):return self._req("POST", "/vms/%s/delete" % name)
 
     def create(self, **cfg):
-        """Create a VM. Config keys: name, osType, imagePath|templateName, ramMb,
-        hddGb, cpuCores, gpuMode(0-2), networkMode(0-3), netAdapter, adminUser,
+        """Create a VM. Config keys: name, osType,
+        imagePath|templateName|diskPath, install, ramMb, hddGb, cpuCores,
+        gpuMode(0-2), networkMode(0-3), netAdapter, adminUser,
         adminPass, testMode, sshEnabled, sshDeployKey, isTemplate. sshDeployKey
         (requires sshEnabled) deploys the AppSandbox public key so you can SSH in
         with key auth (see key_path()); sshInfo reports keyDeployed + sshState 4
-        once it lands. The daemon validates these exactly like the GUI; ramMb is
+        once it lands. diskPath is a prebuilt Linux VHDX and requires
+        install=False. The daemon validates these exactly like the GUI; ramMb is
         rounded down to even here (2 MB-aligned, an HCS requirement, like the GUI).
         Async + auto-starts; watch status/events."""
         if isinstance(cfg.get("ramMb"), int):

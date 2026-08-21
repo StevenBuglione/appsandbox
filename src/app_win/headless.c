@@ -467,14 +467,16 @@ static void trim_ws(wchar_t *s)
 static const char *validate_create(const wchar_t *name, const wchar_t *os,
                                    const wchar_t *user, const wchar_t *pass,
                                    const wchar_t *tpl, const wchar_t *img,
+                                   const wchar_t *disk,
                                    BOOL is_template, int ram_mb, int hdd_gb,
                                    int cpu_cores, int gpu_mode, int net_mode)
 {
-    int i, len; BOOL is_linux, is_win, all_digits, from_template;
+    int i, len; BOOL is_linux, is_win, all_digits, from_template, from_disk;
 
     is_linux = (_wcsicmp(os, L"Linux") == 0);
     is_win   = (_wcsicmp(os, L"Windows") == 0);
     from_template = (tpl && tpl[0] != L'\0');
+    from_disk = (disk && disk[0] != L'\0');
 
     /* name / hostname */
     if (!name || !name[0]) return "VM name is required.";
@@ -501,13 +503,19 @@ static const char *validate_create(const wchar_t *name, const wchar_t *os,
     }
 
     /* image-or-template required; template constraints */
-    if (!from_template && (!img || !img[0])) return "An image (ISO) or template is required.";
+    if (!from_template && !from_disk && (!img || !img[0]))
+        return "An image (ISO), prebuilt disk, or template is required.";
+    if (from_disk && (from_template || (img && img[0])))
+        return "diskPath cannot be combined with imagePath or templateName.";
+    if (from_disk && !is_linux)
+        return "Prebuilt disks are supported only for Linux VMs.";
     if (is_template && from_template)        return "Cannot create a template from another template.";
+    if (is_template && from_disk)            return "Cannot create a template from a prebuilt disk.";
     if (is_template && !is_win)              return "Templates are only supported for Windows.";
 
     /* username / password -- GUI validates on a normal create (onCreateVm) but
        not on a template build (onCreateTemplate); match that. */
-    if (!is_template) {
+    if (!is_template && !from_disk) {
         if (!user || !user[0]) return "Username is required.";
         len = (int)wcslen(user);
         if (is_linux) {
@@ -570,7 +578,7 @@ static int handle_request(PHTTP_REQUEST req)
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/version") == 0) {
         sprintf_s(buf, sizeof(buf),
             "{\"product\":\"AppSandbox\",\"version\":\"%s\",\"apiVersion\":\"%s\",\"hostOs\":\"Windows\","
-            "\"capabilities\":{\"snapshots\":true,\"templates\":true}}",
+            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"prebuiltLinuxDisk\":true}}",
             ASB_PRODUCT_VER, ASB_API_VERSION);
         send_json(req->RequestId, 200, "OK", buf);
         return 0;
@@ -641,20 +649,23 @@ static int handle_request(PHTTP_REQUEST req)
             /* create */
             wchar_t body[8192];
             AsbVmConfig cfg; int iv; BOOL bv;
-            wchar_t name[256]={0}, os[32]={0}, img[MAX_PATH]={0}, tpl[256]={0};
+            wchar_t name[256]={0}, os[32]={0}, img[MAX_PATH]={0}, disk[MAX_PATH]={0}, tpl[256]={0};
             wchar_t user[128]={0}, pass[128]={0}, adapter[256]={0};
+            BOOL install_present = FALSE, install_requested = FALSE;
             char nu[256]={0};
             body_to_wide(req, body, 8192);
             ZeroMemory(&cfg, sizeof(cfg));
             json_get_string(body, L"name", name, 256);
             json_get_string(body, L"osType", os, 32);
             json_get_string(body, L"imagePath", img, MAX_PATH);
+            json_get_string(body, L"diskPath", disk, MAX_PATH);
             json_get_string(body, L"templateName", tpl, 256);
             json_get_string(body, L"adminUser", user, 128);
             json_get_string(body, L"adminPass", pass, 128);
             json_get_string(body, L"netAdapter", adapter, 256);
             trim_ws(name); trim_ws(user);   /* match the GUI's .value.trim() */
             cfg.name = name; cfg.os_type = os; cfg.image_path = img;
+            cfg.disk_path = disk;
             cfg.template_name = tpl; cfg.username = user; cfg.password = pass;
             cfg.net_adapter = adapter;
             if (json_get_int(body, L"ramMb", &iv)) cfg.ram_mb = (DWORD)iv;
@@ -666,13 +677,22 @@ static int handle_request(PHTTP_REQUEST req)
             if (json_get_bool(body, L"sshEnabled", &bv)) cfg.ssh_enabled = bv;
             if (json_get_bool(body, L"sshDeployKey", &bv)) cfg.ssh_deploy_key = bv;
             if (json_get_bool(body, L"isTemplate", &bv)) cfg.is_template = bv;
+            if (json_get_bool(body, L"install", &bv)) {
+                install_present = TRUE;
+                install_requested = bv;
+            }
+            if (disk[0] && (!install_present || install_requested)) {
+                send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                         "diskPath requires install=false");
+                return 0;
+            }
             if (cfg.ssh_deploy_key && !cfg.ssh_enabled) {
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                          "sshDeployKey requires sshEnabled");
                 return 0;
             }
             {
-                const char *verr = validate_create(name, os, user, pass, tpl, img,
+                const char *verr = validate_create(name, os, user, pass, tpl, img, disk,
                     cfg.is_template, (int)cfg.ram_mb, (int)cfg.hdd_gb, (int)cfg.cpu_cores,
                     cfg.gpu_mode, cfg.network_mode);
                 if (verr) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", verr); return 0; }
