@@ -12,11 +12,17 @@
 
 #include <windows.h>
 #include <winhttp.h>
+#include <bcrypt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "bcrypt.lib")
+
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
+#endif
 
 /* Public Azure DevOps NuGet flat-container endpoint. Anonymous, no
  * auth — same URLs the open-source microsoft/WSL repo uses when
@@ -167,6 +173,58 @@ cleanup_sess: WinHttpCloseHandle(hSession);
     return rc;
 }
 
+static int sha256_matches(const wchar_t *path, const char *expected)
+{
+    BCRYPT_ALG_HANDLE algorithm = NULL;
+    BCRYPT_HASH_HANDLE hash_handle = NULL;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    BYTE digest[32];
+    BYTE buffer[65536];
+    char actual[65];
+    DWORD hash_len = 0;
+    DWORD property_len = 0;
+    DWORD bytes_read = 0;
+    int rc = -1;
+
+    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(
+            &algorithm, BCRYPT_SHA256_ALGORITHM, NULL, 0)))
+        goto cleanup;
+    if (!NT_SUCCESS(BCryptGetProperty(
+            algorithm, BCRYPT_HASH_LENGTH, (PBYTE)&hash_len,
+            sizeof(hash_len), &property_len, 0)) || hash_len != sizeof(digest))
+        goto cleanup;
+    if (!NT_SUCCESS(BCryptCreateHash(
+            algorithm, &hash_handle, NULL, 0, NULL, 0, 0)))
+        goto cleanup;
+
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        goto cleanup;
+    for (;;) {
+        if (!ReadFile(file, buffer, sizeof(buffer), &bytes_read, NULL))
+            goto cleanup;
+        if (bytes_read == 0)
+            break;
+        if (!NT_SUCCESS(BCryptHashData(hash_handle, buffer, bytes_read, 0)))
+            goto cleanup;
+    }
+    if (!NT_SUCCESS(BCryptFinishHash(
+            hash_handle, digest, sizeof(digest), 0)))
+        goto cleanup;
+
+    for (int i = 0; i < (int)sizeof(digest); i++)
+        sprintf_s(actual + i * 2, 3, "%02x", digest[i]);
+    actual[64] = '\0';
+    rc = _stricmp(actual, expected) == 0 ? 0 : -1;
+
+cleanup:
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    if (hash_handle) BCryptDestroyHash(hash_handle);
+    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+    return rc;
+}
+
 /* ====================================================================
  * Main flow
  * ==================================================================== */
@@ -175,7 +233,8 @@ int do_prefetch_wsl_deps(const wchar_t *out_dir)
 {
     log_msg(L"wsl-deps: target %s", out_dir);
 
-    /* No cache layer: always download fresh into out_dir for this VM. */
+    /* This helper always refreshes out_dir. The host decides whether a fetch
+       is needed before invoking it for the persistent cache. */
     u_mkdir_p(out_dir);
 
     /* Temp dir for nupkg download + extract; wiped on completion. */
@@ -251,17 +310,28 @@ int do_prefetch_wsl_deps(const wchar_t *out_dir)
         const wchar_t *extract_root;
         const wchar_t *src_rel;
         const wchar_t *dst_name;
+        const char *sha256;
     };
     const struct copy_spec specs[] = {
-        { d3d_extract,    L"build\\native\\lib\\" IP_D3D_LIBDIR L"\\libd3d12.so",     L"libd3d12.so"     },
-        { d3d_extract,    L"build\\native\\lib\\" IP_D3D_LIBDIR L"\\libd3d12core.so", L"libd3d12core.so" },
-        { dxcore_extract, L"build\\native\\lib\\libDXCore.so",         L"libdxcore.so"    }, /* lowercase */
+        { d3d_extract, L"build\\native\\lib\\" IP_D3D_LIBDIR L"\\libd3d12.so",
+          L"libd3d12.so",
+          "b3d78d409a4dbbe8612551fc0c0d746d3e58d7997ee7eba78ce1064d77cfa8c3" },
+        { d3d_extract, L"build\\native\\lib\\" IP_D3D_LIBDIR L"\\libd3d12core.so",
+          L"libd3d12core.so",
+          "a4104a2022932d8e6c714f103ebd89db1c5bdbf36fe92151c88d3d93d4e3894d" },
+        { dxcore_extract, L"build\\native\\lib\\libDXCore.so",
+          L"libdxcore.so",
+          "83d1671a839bcf71709349e77cd68341515df2e63080765618876996a0f4190c" },
     };
     int copied = 0;
     for (int i = 0; i < (int)(sizeof(specs) / sizeof(specs[0])); i++) {
         wchar_t src[MAX_PATH], dst[MAX_PATH];
         swprintf_s(src, MAX_PATH, L"%s\\%s", specs[i].extract_root, specs[i].src_rel);
         swprintf_s(dst, MAX_PATH, L"%s\\%s", out_dir, specs[i].dst_name);
+        if (sha256_matches(src, specs[i].sha256) != 0) {
+            log_err(L"wsl-deps: SHA256 mismatch for %s", src);
+            goto fail;
+        }
         if (!CopyFileW(src, dst, FALSE)) {
             log_err(L"wsl-deps: CopyFileW %s -> %s failed: %lu",
                     src, dst, GetLastError());

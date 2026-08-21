@@ -44,5 +44,7 @@ The `linguum` branch contains only the dynamic Windows/Linux display-sizing POC.
 - Headless `diskPath` plus `install=false` creation interface
 - Strict Linux-only, existing-VHDX validation
 - Process-owned copy into the VM's private ProgramData directory
+- Host-cached Microsoft Linux D3D12/DXCore runtime plus driver-matched
+  `System32\\lxss\\lib` helpers shared over Plan9
 - Reuse of the existing HCS, GPU-PV, Plan9, HvSocket, display, input, audio,
   snapshot, and process-exact cleanup paths

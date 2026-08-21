@@ -477,16 +477,49 @@ BOOL gpu_get_driver_shares(GpuList *gpu_list, GpuDriverShareList *out)
 
 BOOL gpu_append_lxsslib_share(GpuDriverShareList *list)
 {
+    static const wchar_t *required[] = {
+        L"libd3d12.so",
+        L"libd3d12core.so",
+        L"libdxcore.so"
+    };
+    wchar_t program_data[MAX_PATH];
     wchar_t sys_dir[MAX_PATH];
     wchar_t path[MAX_PATH];
     GpuDriverShare *s;
+    int i;
 
     if (!list) return FALSE;
     if (list->count >= MAX_GPU_SHARES) return FALSE;
 
-    if (!GetSystemDirectoryW(sys_dir, MAX_PATH)) return FALSE;
-    swprintf_s(path, MAX_PATH, L"%s\\lxss\\lib", sys_dir);
-    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return FALSE;
+    path[0] = L'\0';
+    if (!GetEnvironmentVariableW(L"ProgramData", program_data, MAX_PATH))
+        wcscpy_s(program_data, MAX_PATH, L"C:\\ProgramData");
+    {
+        wchar_t candidate[MAX_PATH];
+        swprintf_s(candidate, MAX_PATH,
+            L"%s\\AppSandbox\\wsl-deps\\current\\lib", program_data);
+        for (i = 0; i < (int)(sizeof(required) / sizeof(required[0])); i++) {
+            wchar_t file[MAX_PATH];
+            swprintf_s(file, MAX_PATH, L"%s\\%s", candidate, required[i]);
+            if (GetFileAttributesW(file) == INVALID_FILE_ATTRIBUTES)
+                break;
+        }
+        if (i == (int)(sizeof(required) / sizeof(required[0])))
+            wcscpy_s(path, MAX_PATH, candidate);
+    }
+
+    /* Windows installations that already carry the complete generic runtime
+       can use its native directory without a separate host cache. */
+    if (path[0] == L'\0') {
+        if (!GetSystemDirectoryW(sys_dir, MAX_PATH)) return FALSE;
+        swprintf_s(path, MAX_PATH, L"%s\\lxss\\lib", sys_dir);
+        for (i = 0; i < (int)(sizeof(required) / sizeof(required[0])); i++) {
+            wchar_t file[MAX_PATH];
+            swprintf_s(file, MAX_PATH, L"%s\\%s", path, required[i]);
+            if (GetFileAttributesW(file) == INVALID_FILE_ATTRIBUTES)
+                return FALSE;
+        }
+    }
 
     s = &list->shares[list->count];
     wcscpy_s(s->share_name, 128, L"AppSandbox.HostLxssLib");
@@ -601,5 +634,3 @@ BOOL gpu_get_default_driver_path(GpuList *list,
     SetupDiDestroyDeviceInfoList(iface_set);
     return found;
 }
-
-

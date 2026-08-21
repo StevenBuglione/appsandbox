@@ -19,7 +19,8 @@
  *     libd3d12core.so
  *     libdxcore.so                  (lowercased from libDXCore.so)
  *
- * No host cache — per-VM staging only. Re-downloads every VM-create.
+ * The caller chooses whether out_dir is per-VM staging or the persistent
+ * host cache. Extracted files are verified against pinned SHA-256 hashes.
  * Returns 0 on success; non-zero on failure. */
 int do_prefetch_wsl_deps(const wchar_t *out_dir);
 

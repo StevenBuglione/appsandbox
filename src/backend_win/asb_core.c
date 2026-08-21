@@ -47,6 +47,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 /* ---- Globals ---- */
 
 static GpuList g_gpu_list;
+static BOOL ensure_host_wsl_deps(void);
 
 /* Prepare the GL mapping-layer Plan9 share for a Windows GPU guest: ensure the
  * D3D mapping layers (OpenCL/Vulkan/dxil) are fetched/cached on the host, stage
@@ -969,13 +970,16 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
 
     if (args->config.gpu_mode == GPU_DEFAULT || args->config.gpu_mode == GPU_MIRROR) {
         gpu_get_driver_shares(&g_gpu_list, &args->config.gpu_shares);
-        /* For Linux guests, also expose the host's lxss\lib so the
-         * Linux agent mounts it at /usr/lib/wsl/lib alongside the
-         * per-GPU driver shares. Windows guests have no use for it. */
-        if (_wcsicmp(args->config.os_type, L"Linux") == 0)
+        /* For Linux guests, expose the merged host-only WSL GPU runtime so
+         * the agent mounts it at /usr/lib/wsl/lib alongside the per-GPU
+         * DriverStore shares. Windows guests have no use for it. */
+        if (_wcsicmp(args->config.os_type, L"Linux") == 0) {
+            if (!ensure_host_wsl_deps())
+                asb_log(L"Warning: Linux D3D12/DXCore host runtime is unavailable.");
             gpu_append_lxsslib_share(&args->config.gpu_shares);
-        else if (_wcsicmp(args->config.os_type, L"Windows") == 0)
+        } else if (_wcsicmp(args->config.os_type, L"Windows") == 0) {
             prepare_gl_layers_share(&args->config.gpu_shares);
+        }
     }
 
     asb_log(L"Re-creating HCS compute system for \"%s\"...", vm->name);
@@ -1988,8 +1992,8 @@ cleanup:
 }
 
 /* ---- Spawn iso-patch.exe with one of the --prefetch-* modes and
- * block. No cache layer: each call writes directly into <out_dir>
- * which is a subdir of the per-VM staging extras dir.
+ * block. Callers either write into per-VM staging or the host's
+ * versioned AppSandbox dependency cache.
  *
  * args: extra argv tail (no quotes — caller is responsible for safe paths).
  * Returns 0 on success; -1 on any failure. Logs progress to asb_log. */
@@ -2019,6 +2023,141 @@ static int spawn_iso_patch_prefetch(const wchar_t *args)
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return ec == 0 ? 0 : -1;
+}
+
+static BOOL same_file_metadata(const wchar_t *left, const wchar_t *right)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    WIN32_FILE_ATTRIBUTE_DATA b;
+
+    if (!GetFileAttributesExW(left, GetFileExInfoStandard, &a) ||
+        !GetFileAttributesExW(right, GetFileExInfoStandard, &b))
+        return FALSE;
+
+    return a.nFileSizeHigh == b.nFileSizeHigh &&
+           a.nFileSizeLow == b.nFileSizeLow &&
+           CompareFileTime(&a.ftLastWriteTime, &b.ftLastWriteTime) == 0;
+}
+
+/* Microsoft D3D12 loads vendor-provided Linux helpers from the canonical
+ * /usr/lib/wsl/lib directory, not from the separately mounted DriverStore
+ * directory. Keep a host-only mirror of the host's lxss\lib payload beside
+ * the pinned D3D12/DXCore files so one Plan9 mount provides the same runtime
+ * layout as WSL. Files are refreshed only when their size or timestamp
+ * changes, avoiding a multi-hundred-megabyte copy on ordinary VM starts. */
+static BOOL refresh_host_lxss_vendor_libs(const wchar_t *lib_dir)
+{
+    static const wchar_t *d3d_files[] = {
+        L"libd3d12.so",
+        L"libd3d12core.so",
+        L"libdxcore.so"
+    };
+    WIN32_FIND_DATAW find_data;
+    HANDLE find_handle;
+    wchar_t sys_dir[MAX_PATH];
+    wchar_t source_dir[MAX_PATH];
+    wchar_t pattern[MAX_PATH];
+    int copied = 0;
+    BOOL ok = TRUE;
+
+    if (!GetSystemDirectoryW(sys_dir, MAX_PATH))
+        return FALSE;
+    swprintf_s(source_dir, MAX_PATH, L"%s\\lxss\\lib", sys_dir);
+    swprintf_s(pattern, MAX_PATH, L"%s\\*", source_dir);
+
+    find_handle = FindFirstFileW(pattern, &find_data);
+    if (find_handle == INVALID_HANDLE_VALUE)
+        return TRUE;
+
+    do {
+        wchar_t source[MAX_PATH];
+        wchar_t target[MAX_PATH];
+        int i;
+
+        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        for (i = 0; i < (int)(sizeof(d3d_files) / sizeof(d3d_files[0])); i++) {
+            if (_wcsicmp(find_data.cFileName, d3d_files[i]) == 0)
+                break;
+        }
+        if (i != (int)(sizeof(d3d_files) / sizeof(d3d_files[0])))
+            continue;
+
+        swprintf_s(source, MAX_PATH, L"%s\\%s", source_dir,
+                   find_data.cFileName);
+        swprintf_s(target, MAX_PATH, L"%s\\%s", lib_dir,
+                   find_data.cFileName);
+        if (same_file_metadata(source, target))
+            continue;
+        if (!CopyFileW(source, target, FALSE)) {
+            asb_log(L"Warning: could not refresh Linux GPU runtime %s (%lu).",
+                    find_data.cFileName, GetLastError());
+            ok = FALSE;
+            continue;
+        }
+        copied++;
+    } while (FindNextFileW(find_handle, &find_data));
+
+    FindClose(find_handle);
+    if (copied > 0)
+        asb_log(L"Refreshed %d host Linux GPU runtime file(s).", copied);
+    return ok;
+}
+
+/* Ensure Microsoft's Linux D3D12/DXCore runtime is host-cached for Plan9
+ * sharing. The binaries remain outside every guest image. The three generic
+ * runtime files are fetched from the pinned public Microsoft feed; the host's
+ * driver-matched Linux helpers are mirrored from System32\lxss\lib. */
+static BOOL ensure_host_wsl_deps(void)
+{
+    static const wchar_t *required[] = {
+        L"libd3d12.so",
+        L"libd3d12core.so",
+        L"libdxcore.so"
+    };
+    wchar_t base[MAX_PATH];
+    wchar_t wsl_deps[MAX_PATH];
+    wchar_t current[MAX_PATH];
+    wchar_t lib_dir[MAX_PATH];
+    wchar_t args[2 * MAX_PATH];
+    int i;
+
+    if (!GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH))
+        wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+    swprintf_s(wsl_deps, MAX_PATH, L"%s\\AppSandbox\\wsl-deps", base);
+    swprintf_s(current, MAX_PATH, L"%s\\current", wsl_deps);
+    swprintf_s(lib_dir, MAX_PATH, L"%s\\lib", current);
+
+    CreateDirectoryW(wsl_deps, NULL);
+    CreateDirectoryW(current, NULL);
+    CreateDirectoryW(lib_dir, NULL);
+
+    /* Best-effort when WSL is not installed. The pinned generic runtime below
+       remains useful, while a normal WSL-capable host gets its vendor payload. */
+    refresh_host_lxss_vendor_libs(lib_dir);
+
+    for (i = 0; i < (int)(sizeof(required) / sizeof(required[0])); i++) {
+        wchar_t file[MAX_PATH];
+        swprintf_s(file, MAX_PATH, L"%s\\%s", lib_dir, required[i]);
+        if (GetFileAttributesW(file) == INVALID_FILE_ATTRIBUTES)
+            break;
+    }
+    if (i == (int)(sizeof(required) / sizeof(required[0])))
+        return TRUE;
+
+    swprintf_s(args, 2 * MAX_PATH,
+        L"--prefetch-wsl-deps --out-dir \"%s\"", lib_dir);
+    asb_log(L"Fetching host-provided Linux D3D12/DXCore runtime...");
+    if (spawn_iso_patch_prefetch(args) != 0)
+        return FALSE;
+
+    for (i = 0; i < (int)(sizeof(required) / sizeof(required[0])); i++) {
+        wchar_t file[MAX_PATH];
+        swprintf_s(file, MAX_PATH, L"%s\\%s", lib_dir, required[i]);
+        if (GetFileAttributesW(file) == INVALID_FILE_ATTRIBUTES)
+            return FALSE;
+    }
+    return TRUE;
 }
 
 /* ---- Run iso-patch.exe --ubuntu-to-vhdx and stream its progress. ----
@@ -2792,13 +2931,15 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     /* GPU driver shares */
     if ((cfg.gpu_mode == GPU_DEFAULT || cfg.gpu_mode == GPU_MIRROR) && !is_template_create) {
         gpu_get_driver_shares(&g_gpu_list, &cfg.gpu_shares);
-        /* Linux guests additionally consume %SystemRoot%\System32\lxss\lib
-         * (NVIDIA's WSL-staged Linux userspace .so files), mounted at
-         * /usr/lib/wsl/lib by the agent on first connect. */
-        if (_wcsicmp(cfg.os_type, L"Linux") == 0)
+        /* Linux guests additionally consume the merged host-only WSL GPU
+         * runtime, mounted at /usr/lib/wsl/lib by the agent on first connect. */
+        if (_wcsicmp(cfg.os_type, L"Linux") == 0) {
+            if (!ensure_host_wsl_deps())
+                asb_log(L"Warning: Linux D3D12/DXCore host runtime is unavailable.");
             gpu_append_lxsslib_share(&cfg.gpu_shares);
-        else if (_wcsicmp(cfg.os_type, L"Windows") == 0)
+        } else if (_wcsicmp(cfg.os_type, L"Windows") == 0) {
             prepare_gl_layers_share(&cfg.gpu_shares);
+        }
     }
 
     /* ---- VHDX-first path (Windows, from ISO) ---- */
