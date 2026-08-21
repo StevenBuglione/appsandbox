@@ -17,6 +17,7 @@
 #define _ASB_DRM_H_
 
 #include <linux/hrtimer.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 
 #include <drm/drm_device.h>
@@ -63,6 +64,7 @@ struct asb_device {
 	unsigned int            width;
 	unsigned int            height;
 	unsigned int            refresh;
+	struct mutex            mode_lock;
 
 	/* Synthesized 128-byte EDID. Built once at probe, served via
 	 * drm_connector_attach_edid_property() → drm_connector_update_edid_property(). */

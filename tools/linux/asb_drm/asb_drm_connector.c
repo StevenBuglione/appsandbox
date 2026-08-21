@@ -161,6 +161,7 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 	struct drm_display_mode *m;
 	int count = 0;
 
+	mutex_lock(&asb->mode_lock);
 	drm_connector_update_edid_property(connector,
 	                                   (const struct edid *)asb->edid);
 
@@ -202,6 +203,7 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 		}
 	}
 
+	mutex_unlock(&asb->mode_lock);
 	return count;
 }
 

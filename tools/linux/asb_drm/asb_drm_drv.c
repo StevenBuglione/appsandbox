@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/platform_device.h>
+#include <linux/string.h>
 #include <linux/version.h>
 
 #include <drm/drm_atomic_helper.h>
@@ -47,6 +48,78 @@ module_param_named(height,  height_param,  uint, 0444);
 MODULE_PARM_DESC(height,  "Initial display height (default 1080)");
 module_param_named(refresh, refresh_param, uint, 0444);
 MODULE_PARM_DESC(refresh, "Refresh rate in Hz     (default 60)");
+
+/* --------------------------------------------------------------------------
+ * Runtime mode control
+ * -------------------------------------------------------------------------- */
+
+static ssize_t mode_show(struct device *dev,
+			 struct device_attribute *attr, char *buf)
+{
+	struct drm_device *drm = dev_get_drvdata(dev);
+	struct asb_device *asb;
+	unsigned int width, height, refresh;
+
+	if (!drm)
+		return -ENODEV;
+	asb = to_asb(drm);
+
+	mutex_lock(&asb->mode_lock);
+	width = asb->width;
+	height = asb->height;
+	refresh = asb->refresh;
+	mutex_unlock(&asb->mode_lock);
+
+	return sysfs_emit(buf, "%ux%u@%u\n", width, height, refresh);
+}
+
+static ssize_t mode_store(struct device *dev, struct device_attribute *attr,
+			  const char *buf, size_t count)
+{
+	struct drm_device *drm = dev_get_drvdata(dev);
+	struct asb_device *asb;
+	char value[32];
+	char extra;
+	char *mode;
+	unsigned int width, height, refresh;
+
+	if (!drm)
+		return -ENODEV;
+	if (!count || count >= sizeof(value))
+		return -EINVAL;
+
+	memcpy(value, buf, count);
+	value[count] = '\0';
+	mode = strim(value);
+	if (sscanf(mode, "%ux%u@%u%c", &width, &height, &refresh, &extra) != 3)
+		return -EINVAL;
+	if (width < 64 || width > ASB_MAX_WIDTH ||
+	    height < 64 || height > ASB_MAX_HEIGHT ||
+	    refresh != ASB_DEFAULT_REFRESH)
+		return -ERANGE;
+
+	asb = to_asb(drm);
+	mutex_lock(&asb->mode_lock);
+	if (asb->width == width && asb->height == height &&
+	    asb->refresh == refresh) {
+		mutex_unlock(&asb->mode_lock);
+		return count;
+	}
+
+	asb->width = width;
+	asb->height = height;
+	asb->refresh = refresh;
+	asb_build_edid(asb);
+	asb->vblank_period = ns_to_ktime(NSEC_PER_SEC / asb->refresh);
+	mutex_unlock(&asb->mode_lock);
+
+	drm_kms_helper_hotplug_event(drm);
+	dev_info(dev, "preferred mode changed to %ux%u@%uHz\n",
+		 width, height, refresh);
+	return count;
+}
+
+static DEVICE_ATTR_RW(mode);
 
 /* --------------------------------------------------------------------------
  * drm_driver
@@ -146,6 +219,7 @@ static int asb_probe(struct platform_device *pdev)
 
 	drm = &asb->drm;
 	platform_set_drvdata(pdev, drm);
+	mutex_init(&asb->mode_lock);
 
 	/* Clamp module params into the supported range. */
 	asb->width   = clamp(width_param,   64u, (unsigned)ASB_MAX_WIDTH);
@@ -192,6 +266,15 @@ static int asb_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ret = device_create_file(&pdev->dev, &dev_attr_mode);
+	if (ret) {
+		dev_err(&pdev->dev, "mode attribute creation failed: %d\n", ret);
+		drm_dev_unregister(drm);
+		asb_mode_fini(asb);
+		drm_atomic_helper_shutdown(drm);
+		return ret;
+	}
+
 	dev_info(&pdev->dev, "AppSandbox virtual display ready: %ux%u@%uHz\n",
 	         asb->width, asb->height, asb->refresh);
 	return 0;
@@ -202,6 +285,7 @@ static void asb_remove(struct platform_device *pdev)
 	struct drm_device *drm = platform_get_drvdata(pdev);
 	struct asb_device *asb = to_asb(drm);
 
+	device_remove_file(&pdev->dev, &dev_attr_mode);
 	drm_dev_unplug(drm);
 	asb_mode_fini(asb);
 	drm_atomic_helper_shutdown(drm);
