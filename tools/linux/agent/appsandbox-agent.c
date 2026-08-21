@@ -48,6 +48,12 @@
 #define HEARTBEAT_INTERVAL_SEC  5
 #define LINE_BUF_MAX            4096
 #define REPLY_MAX               256
+#define DISPLAY_MIN_WIDTH       64u
+#define DISPLAY_MIN_HEIGHT      64u
+#define DISPLAY_MAX_WIDTH       7680u
+#define DISPLAY_MAX_HEIGHT      4320u
+#define DISPLAY_REFRESH         60u
+#define ASB_DRM_MODE_PATH       "/sys/devices/platform/asb_drm.0/mode"
 
 /* ---- Global state for the currently-active client connection ---- */
 
@@ -482,6 +488,54 @@ static void *heartbeat_thread(void *arg)
 }
 
 /* ---- Command handlers ---- */
+
+static void handle_display_resize(int fd, const char *tag, const char *args)
+{
+    unsigned int width, height, refresh;
+    char extra;
+    char mode[32];
+    int mode_fd;
+    int mode_len;
+    ssize_t written;
+
+    if (sscanf(args, "%ux%u@%u%c", &width, &height, &refresh, &extra) != 3) {
+        send_reply(fd, tag, "error:bad_display_mode");
+        return;
+    }
+    if (width < DISPLAY_MIN_WIDTH || width > DISPLAY_MAX_WIDTH ||
+        height < DISPLAY_MIN_HEIGHT || height > DISPLAY_MAX_HEIGHT ||
+        refresh != DISPLAY_REFRESH) {
+        send_reply(fd, tag, "error:unsupported_display_mode");
+        return;
+    }
+
+    mode_len = snprintf(mode, sizeof(mode), "%ux%u@%u", width, height, refresh);
+    if (mode_len <= 0 || (size_t)mode_len >= sizeof(mode)) {
+        send_reply(fd, tag, "error:bad_display_mode");
+        return;
+    }
+
+    mode_fd = open(ASB_DRM_MODE_PATH, O_WRONLY | O_CLOEXEC);
+    if (mode_fd < 0) {
+        agent_log("display_resize: open %s failed: %s",
+                  ASB_DRM_MODE_PATH, strerror(errno));
+        send_reply(fd, tag, "error:mode_unavailable");
+        return;
+    }
+
+    written = write(mode_fd, mode, (size_t)mode_len);
+    if (close(mode_fd) != 0 && written == mode_len)
+        written = -1;
+    if (written != mode_len) {
+        agent_log("display_resize: write %s failed: %s",
+                  mode, strerror(errno));
+        send_reply(fd, tag, "error:mode_write_failed");
+        return;
+    }
+
+    agent_log("display_resize: requested %s", mode);
+    send_reply(fd, tag, "ok");
+}
 
 /* set_ip:<ip>/<prefix>:<gw>
  *   e.g. set_ip:192.168.42.2/24:192.168.42.1
@@ -1111,6 +1165,9 @@ static void handle_client(int fd)
         }
         else if (strncmp(cmd, "set_ip:", 7) == 0) {
             handle_set_ip(fd, tag, cmd + 7);
+        }
+        else if (strncmp(cmd, "display_resize:", 15) == 0) {
+            handle_display_resize(fd, tag, cmd + 15);
         }
         else if (strcmp(cmd, "ssh_enable") == 0) {
             handle_ssh_enable(fd, tag);
