@@ -152,6 +152,7 @@ typedef struct InputPacket {
 #define PRESENT_MS      16   /* ~60 fps */
 #define IDT_RESIZE_DEBOUNCE 2002
 #define RESIZE_DEBOUNCE_MS  33
+#define INITIAL_RESIZE_WAIT_MS 10000
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -274,6 +275,7 @@ struct VmDisplayIdd {
     UINT           last_applied_width;
     UINT           last_applied_height;
     BOOL           resize_pending;
+    BOOL           in_size_move;
 
     UINT           render_count;     /* number of renders (for one-shot logging) */
     volatile UINT  recv_count;       /* number of frames received over HvSocket */
@@ -652,6 +654,20 @@ static void idd_note_applied_frame(VmDisplayIdd *d, UINT width, UINT height)
     }
 }
 
+static BOOL idd_resize_is_settled(VmDisplayIdd *d)
+{
+    BOOL settled;
+
+    EnterCriticalSection(&d->resize_cs);
+    settled = d->desired_guest_width >= MIN_FRAME_WIDTH &&
+              d->desired_guest_height >= MIN_FRAME_HEIGHT &&
+              d->last_applied_width == d->desired_guest_width &&
+              d->last_applied_height == d->desired_guest_height;
+    LeaveCriticalSection(&d->resize_cs);
+
+    return settled;
+}
+
 static DWORD WINAPI idd_resize_thread_proc(LPVOID param)
 {
     VmDisplayIdd *d = (VmDisplayIdd *)param;
@@ -973,7 +989,7 @@ static void compute_letterbox(UINT client_w, UINT client_h,
 }
 
 /* Map window client coordinates to VM framebuffer coordinates */
-static void window_to_vm_coords(HWND hwnd, int wx, int wy,
+static void window_to_vm_coords(HWND hwnd, int wx, int wy, BOOL stretch,
                                  UINT vm_w, UINT vm_h,
                                  UINT *vx, UINT *vy)
 {
@@ -982,8 +998,15 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy,
     float local_x, local_y;
 
     GetClientRect(hwnd, &rc);
-    compute_letterbox((UINT)rc.right, (UINT)rc.bottom, vm_w, vm_h,
-                      &vp_x, &vp_y, &vp_w, &vp_h);
+    if (stretch) {
+        vp_x = 0;
+        vp_y = 0;
+        vp_w = (float)rc.right;
+        vp_h = (float)rc.bottom;
+    } else {
+        compute_letterbox((UINT)rc.right, (UINT)rc.bottom, vm_w, vm_h,
+                          &vp_x, &vp_y, &vp_w, &vp_h);
+    }
 
     if (vp_w <= 0 || vp_h <= 0) {
         *vx = 0;
@@ -1574,13 +1597,24 @@ static void d3d_render_frame(VmDisplayIdd *d)
         LeaveCriticalSection(&d->frame_cs);
     }
 
-    /* Compute letterboxed viewport within client area */
+    /* Application windows always fill their native client area. While Cage is
+       applying the final mode after a resize, stretch the last good frame for
+       a few milliseconds instead of exposing black letterbox bars. At the
+       settled 1:1 size this has no scaling cost. Diagnostic display mode keeps
+       its aspect-preserving viewport. */
     GetClientRect(d->render_hwnd, &rc);
     {
         float vp_x, vp_y, vp_w, vp_h;
-        compute_letterbox((UINT)rc.right, (UINT)rc.bottom,
-                          d->frame_width, d->frame_height,
-                          &vp_x, &vp_y, &vp_w, &vp_h);
+        if (d->app_mode) {
+            vp_x = 0;
+            vp_y = 0;
+            vp_w = (float)rc.right;
+            vp_h = (float)rc.bottom;
+        } else {
+            compute_letterbox((UINT)rc.right, (UINT)rc.bottom,
+                              d->frame_width, d->frame_height,
+                              &vp_x, &vp_y, &vp_w, &vp_h);
+        }
         ZeroMemory(&vp, sizeof(vp));
         vp.TopLeftX = vp_x;
         vp.TopLeftY = vp_y;
@@ -2234,7 +2268,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     /* Compute the outer size from the requested physical client pixels. */
     {
-        DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
+        DWORD style   = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
         DWORD exstyle = d->app_mode ? WS_EX_APPWINDOW : 0;
         RECT wr = { 0, 0, (LONG)d->initial_width, (LONG)d->initial_height };
         UINT dpi = GetDpiForSystem();
@@ -2281,11 +2315,6 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
         }
     }
-
-    /* Bring the display window to the foreground on open */
-    ShowWindow(d->hwnd, SW_SHOW);
-    BringWindowToTop(d->hwnd);
-    SetForegroundWindow(d->hwnd);
 
     /* Render child fills entire client area */
     {
@@ -2360,6 +2389,24 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         d->open = FALSE;
         return 1;
     }
+
+    /* Resolve the guest to the exact native client size before revealing the
+       application window. Cage may have just restarted at its firmware mode;
+       showing the host first exposes that stale frame until a later WM_SIZE.
+       The receiver updates last_applied_* independently of this UI thread. */
+    idd_update_desired_resize(d, d->hwnd);
+    idd_queue_desired_resize(d);
+    {
+        DWORD started = GetTickCount();
+        while (!d->stop && !idd_resize_is_settled(d) &&
+               GetTickCount() - started < INITIAL_RESIZE_WAIT_MS)
+            Sleep(25);
+    }
+
+    /* Bring the correctly sized display window to the foreground on open. */
+    ShowWindow(d->hwnd, SW_SHOW);
+    BringWindowToTop(d->hwnd);
+    SetForegroundWindow(d->hwnd);
 
     /* Start a present timer for steady rendering */
     SetTimer(d->hwnd, IDT_PRESENT, PRESENT_MS, NULL);
@@ -2568,15 +2615,31 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
             d3d_resize_swap_chain(d);
+            d3d_render_frame(d);
             if (wp != SIZE_MINIMIZED) {
                 idd_update_desired_resize(d, hwnd);
-                SetTimer(hwnd, IDT_RESIZE_DEBOUNCE, RESIZE_DEBOUNCE_MS, NULL);
+                /* During an interactive drag, the native swap chain follows
+                   every WM_SIZE immediately while the guest keeps rendering
+                   its current mode. A DRM modeset for every few pixels makes
+                   the compositor trail the pointer by seconds; queue one
+                   exact guest resize from WM_EXITSIZEMOVE instead. */
+                if (!d->in_size_move)
+                    SetTimer(hwnd, IDT_RESIZE_DEBOUNCE,
+                             RESIZE_DEBOUNCE_MS, NULL);
             }
+        }
+        return 0;
+
+    case WM_ENTERSIZEMOVE:
+        if (d) {
+            d->in_size_move = TRUE;
+            KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
         }
         return 0;
 
     case WM_EXITSIZEMOVE:
         if (d) {
+            d->in_size_move = FALSE;
             KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
             idd_update_desired_resize(d, hwnd);
             idd_queue_desired_resize(d);
@@ -2678,6 +2741,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 /* lp coords are relative to render child */
                 window_to_vm_coords(d->render_hwnd,
                                     (int)(short)LOWORD(lp), (int)(short)HIWORD(lp),
+                                    d->app_mode,
                                     frame_width, frame_height, &vx, &vy);
                 if (!_wcsicmp(d->os_type, L"Linux") &&
                     !d->input_frame_size_supported) {
