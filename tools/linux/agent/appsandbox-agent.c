@@ -723,8 +723,9 @@ static void handle_display_resize(int fd, const char *tag, const char *args)
  *   2. Remove every other *.yaml in /etc/netplan so the merge has only
  *      our file to consider — no coexistence games.
  *   3. Write /etc/netplan/99-appsandbox.yaml with the host-assigned
- *      address + gateway + DNS (gateway primary, 8.8.8.8 fallback —
- *      same DNS layout the Windows agent uses).
+ *      address + gateway + reachable DNS resolvers. The HCN NAT gateway
+ *      routes packets but does not provide a DNS proxy, so advertising it as
+ *      a resolver adds a multi-second timeout to every uncached lookup.
  *   4. `netplan apply` then `systemctl restart systemd-networkd` so the
  *      kernel actually drops any stale addresses from a prior config.
  *
@@ -788,7 +789,7 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
         "        - to: default\n"
         "          via: %s\n"
         "      nameservers:\n"
-        "        addresses: [%s, 8.8.8.8]\n"
+        "        addresses: [8.8.8.8, 1.1.1.1]\n"
         "EOF\n"
         /* Apply, then restart the renderer to drop stale leases / state
          * left behind by cloud-init or a previous run. netplan apply
@@ -821,7 +822,7 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
         "  sleep 0.5; "
         "done; "
         "echo 'set_ip: address never appeared'; ip -4 addr show; exit 1",
-        ip, prefix, gw, gw, ip);
+        ip, prefix, gw, ip);
     if (n < 0 || n >= (int)sizeof(cmd)) {
         send_reply(fd, tag, "error:cmd_too_long");
         return;
