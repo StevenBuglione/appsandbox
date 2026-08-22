@@ -736,7 +736,7 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
     const char *slash  = strchr(args, '/');
     const char *colon2 = slash ? strchr(slash, ':') : NULL;
     size_t ip_len, pfx_len;
-    char cmd[2400];
+    char cmd[3200];
     int n, rc;
 
     if (!slash || !colon2) {
@@ -810,15 +810,21 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
         "umask 022 && "
         "netplan apply 2>&1; "
         "if [ \"$RENDERER\" = NetworkManager ]; then "
-        "  systemctl restart NetworkManager 2>&1; "
+        "  systemctl restart NetworkManager 2>&1 && "
+        /* NetworkManager may adopt the already-configured NIC as an external
+         * connection during its restart. Explicitly activate netplan's
+         * profile so its DNS settings, not stale resolver state, win. */
+        "  nmcli connection up netplan-appsbnic "
+        "    ifname \"$(ls /sys/class/net | grep '^e' | head -n 1)\" 2>&1; "
         "else "
         "  systemctl restart systemd-networkd 2>&1; "
         "fi; "
-        /* Verify the address actually materialised. netplan apply / NM
-         * reload are async — the host might try to SSH before the new
-         * IP claims the wire. Poll for up to 5 seconds. */
+        /* Verify the address and resolver actually materialised. netplan
+         * apply / NM reload are async — the host might try to SSH before the
+         * new state claims the wire. Poll for up to 5 seconds. */
         "for i in 1 2 3 4 5 6 7 8 9 10; do "
-        "  ip -4 addr show | grep -q '%s/' && exit 0; "
+        "  ip -4 addr show | grep -q '%s/' && "
+        "    grep -q '^nameserver 8.8.8.8$' /etc/resolv.conf && exit 0; "
         "  sleep 0.5; "
         "done; "
         "echo 'set_ip: address never appeared'; ip -4 addr show; exit 1",
