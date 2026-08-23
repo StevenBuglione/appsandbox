@@ -149,10 +149,12 @@ typedef struct InputPacket {
 #define WM_IDD_FOCUS            (WM_USER + 101)
 #define WM_IDD_RESIZE           (WM_USER + 102)
 #define WM_IDD_RESIZE_PHASE     (WM_USER + 103)
+#define WM_IDD_STARTUP_TASKBAR  (WM_USER + 104)
 
 #define IDT_RESIZE_DEBOUNCE 2002
 #define RESIZE_DEBOUNCE_MS  33
 #define PRESENT_RETRY_MS     16
+#define STARTUP_ANIMATION_MS 120
 #define INITIAL_RESIZE_WAIT_MS 10000
 #define RENDER_START_TIMEOUT_MS 15000
 #define POINTER_SETTLE_MS    24
@@ -246,6 +248,18 @@ struct VmDisplayIdd {
     BOOL         show_debug_overlay;
     BOOL         show_on_open;
     HICON        custom_icon;
+    AsbWindowChromeOptions window_chrome;
+
+    /* Host-owned startup presentation. It is rendered by the same D3D worker
+       and swap chain as the guest, so the first visible client pixel is never
+       an uninitialized/black placeholder or a second splash HWND. */
+    BOOL            startup_enabled;
+    BOOL            startup_auto_ready;
+    volatile LONG   startup_phase;
+    volatile LONG   startup_detailed;
+    volatile LONG   startup_visible;
+    VmStartupScene *startup_scene;
+    ITaskbarList3  *taskbar;
 
     /* D3D11 */
     ID3D11Device            *device;
@@ -256,6 +270,10 @@ struct VmDisplayIdd {
     ID3D11ShaderResourceView *frame_srv;
     UINT                     frame_tex_width;
     UINT                     frame_tex_height;
+    ID3D11Texture2D         *startup_tex;
+    ID3D11ShaderResourceView *startup_srv;
+    UINT                     startup_tex_width;
+    UINT                     startup_tex_height;
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
     ID3D11SamplerState      *sampler;
@@ -1575,6 +1593,103 @@ static BOOL d3d_ensure_frame_texture(VmDisplayIdd *d, UINT width, UINT height)
     return TRUE;
 }
 
+static BOOL idd_startup_is_visible(VmDisplayIdd *d)
+{
+    AsbStartupPhase phase;
+    if (!d || !d->startup_enabled || !d->startup_scene)
+        return FALSE;
+    phase = (AsbStartupPhase)InterlockedCompareExchange(
+        &d->startup_phase, 0, 0);
+    if (phase == ASB_STARTUP_DISABLED)
+        return FALSE;
+    if (phase == ASB_STARTUP_READY &&
+        InterlockedCompareExchange64(&d->received_frame_generation, 0, 0) > 0 &&
+        d->frame_srv)
+        return FALSE;
+    return TRUE;
+}
+
+static BOOL d3d_update_startup_texture(VmDisplayIdd *d)
+{
+    VmStartupSceneFrame frame;
+    AsbStartupPhase phase;
+    D3D11_TEXTURE2D_DESC desc;
+    D3D11_SUBRESOURCE_DATA initial;
+    ID3D11Texture2D *texture = NULL;
+    ID3D11ShaderResourceView *view = NULL;
+    HRESULT hr;
+
+    if (!d || !d->startup_scene) return FALSE;
+    phase = (AsbStartupPhase)InterlockedCompareExchange(
+        &d->startup_phase, 0, 0);
+    if (phase == ASB_STARTUP_READY)
+        phase = ASB_STARTUP_FINISHING;
+    if (!vm_startup_scene_render(
+            d->startup_scene, d->render_width, d->render_height,
+            d->hwnd ? GetDpiForWindow(d->hwnd) : 96,
+            phase,
+            InterlockedCompareExchange(&d->startup_detailed, 0, 0) != 0,
+            GetTickCount64(), &frame))
+        return FALSE;
+
+    if (!d->startup_tex || d->startup_tex_width != frame.width ||
+        d->startup_tex_height != frame.height) {
+        ZeroMemory(&desc, sizeof(desc));
+        desc.Width = frame.width;
+        desc.Height = frame.height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        ZeroMemory(&initial, sizeof(initial));
+        initial.pSysMem = frame.pixels;
+        initial.SysMemPitch = frame.stride;
+        hr = d->device->lpVtbl->CreateTexture2D(
+            d->device, &desc, &initial, &texture);
+        if (SUCCEEDED(hr))
+            hr = d->device->lpVtbl->CreateShaderResourceView(
+                d->device, (ID3D11Resource *)texture, NULL, &view);
+        if (FAILED(hr)) {
+            if (view) view->lpVtbl->Release(view);
+            if (texture) texture->lpVtbl->Release(texture);
+            return FALSE;
+        }
+        if (d->startup_srv) d->startup_srv->lpVtbl->Release(d->startup_srv);
+        if (d->startup_tex) d->startup_tex->lpVtbl->Release(d->startup_tex);
+        d->startup_tex = texture;
+        d->startup_srv = view;
+        d->startup_tex_width = frame.width;
+        d->startup_tex_height = frame.height;
+        return TRUE;
+    }
+
+    if (frame.updated) {
+        if (frame.full_dirty) {
+            d->ctx->lpVtbl->UpdateSubresource(
+                d->ctx, (ID3D11Resource *)d->startup_tex, 0,
+                NULL, frame.pixels, frame.stride, 0);
+        } else if (frame.dirty.right > frame.dirty.left &&
+                   frame.dirty.bottom > frame.dirty.top) {
+            D3D11_BOX box;
+            const BYTE *source;
+            box.left = (UINT)frame.dirty.left;
+            box.top = (UINT)frame.dirty.top;
+            box.front = 0;
+            box.right = (UINT)frame.dirty.right;
+            box.bottom = (UINT)frame.dirty.bottom;
+            box.back = 1;
+            source = frame.pixels + (SIZE_T)box.top * frame.stride +
+                     (SIZE_T)box.left * 4;
+            d->ctx->lpVtbl->UpdateSubresource(
+                d->ctx, (ID3D11Resource *)d->startup_tex, 0,
+                &box, source, frame.stride, 0);
+        }
+    }
+    return TRUE;
+}
+
 static BOOL d3d_init(VmDisplayIdd *d)
 {
     DXGI_SWAP_CHAIN_DESC1 scd;
@@ -1784,9 +1899,11 @@ static BOOL d3d_render_frame(VmDisplayIdd *d)
 {
     D3D11_MAPPED_SUBRESOURCE mapped;
     D3D11_VIEWPORT vp;
+    ID3D11ShaderResourceView *display_srv;
     HRESULT hr;
     float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     BOOL frame_uploaded = FALSE;
+    BOOL startup_active;
 
     if (!d->device || !d->ctx || !d->swap_chain || !d->rtv)
         return FALSE;
@@ -1824,8 +1941,23 @@ static BOOL d3d_render_frame(VmDisplayIdd *d)
         LeaveCriticalSection(&d->frame_cs);
     }
 
+    startup_active = idd_startup_is_visible(d);
+    if (startup_active && !d3d_update_startup_texture(d)) {
+        idd_log(d, L"Startup scene render failed; retaining the previous complete surface.");
+        return TRUE;
+    }
+    {
+        LONG previous = InterlockedExchange(
+            &d->startup_visible, startup_active ? 1 : 0);
+        if (previous != 0 && !startup_active && d->hwnd)
+            PostMessageW(d->hwnd, WM_IDD_STARTUP_TASKBAR,
+                         ASB_STARTUP_DISABLED, 0);
+    }
+    display_srv = startup_active ? d->startup_srv : d->frame_srv;
+
     /* A fixed-capacity application canvas is cropped 1:1. Legacy application
-       mode still fills its client, and diagnostic mode remains letterboxed. */
+       mode fills its client, and diagnostic mode remains letterboxed. The
+       startup surface follows that same qualified viewport policy. */
     {
         float vp_x, vp_y, vp_w, vp_h;
         if (d->app_mode && d->fixed_backing) {
@@ -1873,7 +2005,7 @@ static BOOL d3d_render_frame(VmDisplayIdd *d)
 
     d->ctx->lpVtbl->VSSetShader(d->ctx, d->vs, NULL, 0);
     d->ctx->lpVtbl->PSSetShader(d->ctx, d->ps, NULL, 0);
-    d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 1, &d->frame_srv);
+    d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 1, &display_srv);
     d->ctx->lpVtbl->PSSetSamplers(d->ctx, 0, 1, &d->sampler);
 
     /* Draw fullscreen triangle (3 vertices, no vertex buffer) */
@@ -1904,6 +2036,10 @@ static void d3d_cleanup(VmDisplayIdd *d)
     if (d->sampler)    { d->sampler->lpVtbl->Release(d->sampler);       d->sampler = NULL; }
     if (d->ps)         { d->ps->lpVtbl->Release(d->ps);                 d->ps = NULL; }
     if (d->vs)         { d->vs->lpVtbl->Release(d->vs);                 d->vs = NULL; }
+    if (d->startup_srv) { d->startup_srv->lpVtbl->Release(d->startup_srv); d->startup_srv = NULL; }
+    if (d->startup_tex) { d->startup_tex->lpVtbl->Release(d->startup_tex); d->startup_tex = NULL; }
+    d->startup_tex_width = 0;
+    d->startup_tex_height = 0;
     if (d->frame_srv)  { d->frame_srv->lpVtbl->Release(d->frame_srv);   d->frame_srv = NULL; }
     if (d->frame_tex)  { d->frame_tex->lpVtbl->Release(d->frame_tex);   d->frame_tex = NULL; }
     d->frame_tex_width = 0;
@@ -1928,14 +2064,20 @@ static DWORD WINAPI idd_render_thread_proc(LPVOID param)
         return 1;
     }
 
+    present_retry = d3d_render_frame(d);
     InterlockedExchange(&d->render_init_result, 1);
     SetEvent(d->render_ready_event);
-    present_retry = d3d_render_frame(d);
 
     while (!d->stop) {
+        DWORD wait_ms = INFINITE;
         DWORD wait_result = WaitForSingleObject(
                 d->render_event,
-                present_retry ? PRESENT_RETRY_MS : INFINITE);
+                present_retry ? PRESENT_RETRY_MS :
+                (idd_startup_is_visible(d) &&
+                 vm_startup_scene_is_animated(d->startup_scene) &&
+                 InterlockedCompareExchange(&d->startup_phase, 0, 0) !=
+                    ASB_STARTUP_FAILED
+                    ? STARTUP_ANIMATION_MS : wait_ms));
         UINT desired_width;
         UINT desired_height;
         BOOL resize_requested;
@@ -2474,6 +2616,19 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             d->recv_count++;
             InterlockedExchange64(&d->last_guest_frame_sequence, (LONG64)hdr.frame_seq);
             InterlockedIncrement64(&d->received_frame_generation);
+            if (d->startup_enabled) {
+                if (d->startup_auto_ready) {
+                    InterlockedExchange(&d->startup_phase, ASB_STARTUP_READY);
+                } else if (InterlockedCompareExchange(
+                               &d->startup_phase, 0, 0) <
+                           ASB_STARTUP_FINISHING) {
+                    InterlockedExchange(&d->startup_phase,
+                                        ASB_STARTUP_FINISHING);
+                    if (d->hwnd)
+                        PostMessageW(d->hwnd, WM_IDD_STARTUP_TASKBAR,
+                                     ASB_STARTUP_FINISHING, 0);
+                }
+            }
             LeaveCriticalSection(&d->frame_cs);
             idd_note_applied_frame(d, hdr.width, hdr.height);
 
@@ -2598,6 +2753,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     wchar_t title[300];
     MSG msg;
+    BOOL com_initialized = FALSE;
 
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ensure_idd_class(d->hInstance);
@@ -2639,11 +2795,10 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         }
     }
 
-    /* Dark mode title bar to match AppSandbox main window */
-    {
-        BOOL dark = TRUE;
-        DwmSetWindowAttribute(d->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
-    }
+    /* Keep the genuine Windows frame and caption controls. Applications may
+       tint documented DWM attributes without replacing native Snap, resize,
+       system-menu, keyboard, or accessibility behavior. */
+    vm_window_chrome_apply(d->hwnd, &d->window_chrome, TRUE);
 
     /* VM/debug controls never appear on an application-mode window. */
     if (!d->app_mode) {
@@ -2758,13 +2913,13 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         return 1;
     }
 
-    /* Resolve the guest to the exact native client size before revealing the
-       application window. Cage may have just restarted at its firmware mode;
-       showing the host first exposes that stale frame until a later WM_SIZE.
-       The receiver updates last_applied_* independently of this UI thread. */
+    /* Resolve the guest to the exact native client size. A startup-enabled
+       application can be revealed immediately because its first complete D3D
+       surface is the host-owned thinking scene, not a stale guest frame. The
+       legacy/diagnostic path retains its hidden initial settle behavior. */
     idd_update_desired_resize(d, d->hwnd);
     idd_queue_desired_resize(d);
-    {
+    if (!d->startup_enabled) {
         DWORD started = GetTickCount();
         while (!d->stop && !idd_resize_is_settled(d) &&
                GetTickCount() - started < INITIAL_RESIZE_WAIT_MS)
@@ -2778,6 +2933,21 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         BringWindowToTop(d->hwnd);
         SetForegroundWindow(d->hwnd);
     }
+    if (d->startup_enabled) {
+        HRESULT com_result = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+        com_initialized = SUCCEEDED(com_result);
+        if (com_initialized &&
+            SUCCEEDED(CoCreateInstance(
+                &CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER,
+                &IID_ITaskbarList3, (void **)&d->taskbar)) &&
+            d->taskbar) {
+            d->taskbar->lpVtbl->HrInit(d->taskbar);
+            d->taskbar->lpVtbl->SetProgressState(
+                d->taskbar, d->hwnd, TBPF_INDETERMINATE);
+        }
+        InterlockedExchange(&d->startup_phase, ASB_STARTUP_PREPARING);
+        idd_request_render(d, FALSE);
+    }
 
     /* Install the hotkey hook on this (message-pumping) thread if the
        persisted setting has Transmit mode enabled. */
@@ -2789,6 +2959,13 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+
+    if (d->taskbar) {
+        d->taskbar->lpVtbl->Release(d->taskbar);
+        d->taskbar = NULL;
+    }
+    if (com_initialized)
+        CoUninitialize();
 
     return 0;
 }
@@ -2990,8 +3167,20 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                      suggested->right - suggested->left,
                      suggested->bottom - suggested->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
+        if (d && d->app_mode)
+            vm_window_chrome_apply(hwnd, &d->window_chrome,
+                                   GetActiveWindow() == hwnd);
         return 0;
     }
+
+    case WM_THEMECHANGED:
+    case WM_SETTINGCHANGE:
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+        if (d && d->app_mode)
+            vm_window_chrome_apply(hwnd, &d->window_chrome,
+                                   GetActiveWindow() == hwnd);
+        idd_request_render(d, FALSE);
+        return 0;
 
     case WM_SIZE:
         if (d) {
@@ -3126,6 +3315,18 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
 
+    case WM_IDD_STARTUP_TASKBAR:
+        if (d && d->taskbar) {
+            TBPFLAG state = TBPF_INDETERMINATE;
+            if ((AsbStartupPhase)wp == ASB_STARTUP_DISABLED)
+                state = TBPF_NOPROGRESS;
+            else if ((AsbStartupPhase)wp == ASB_STARTUP_FAILED)
+                state = TBPF_ERROR;
+            d->taskbar->lpVtbl->SetProgressState(
+                d->taskbar, hwnd, state);
+        }
+        return 0;
+
     case WM_SETFOCUS:
         if (d && d->clipboard)
             vm_clipboard_set_sync_enabled(d->clipboard, TRUE);
@@ -3144,6 +3345,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ACTIVATE:
         if (d) {
             d->input_focused = (LOWORD(wp) != WA_INACTIVE);
+            if (d->app_mode)
+                vm_window_chrome_apply(hwnd, &d->window_chrome,
+                                       d->input_focused);
             if (!d->input_focused)
                 idd_flush_held_keys(d);
         }
@@ -3165,6 +3369,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 d->tracking = TRUE;
             }
             d->mouse_in = TRUE;
+
+            if (InterlockedCompareExchange(&d->startup_visible, 0, 0) != 0)
+                return 0;
 
             {
                 UINT vx, vy, frame_width, frame_height;
@@ -3197,7 +3404,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
-            if (d && d->guest_cursor)
+            if (d && InterlockedCompareExchange(
+                         &d->startup_visible, 0, 0) != 0)
+                SetCursor(LoadCursorW(NULL, IDC_ARROW));
+            else if (d && d->guest_cursor)
                 SetCursor(d->guest_cursor);
             else
                 SetCursor(LoadCursorW(NULL, IDC_ARROW));
@@ -3207,6 +3417,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     /* ---- Mouse button/wheel forwarding (only when cursor is in render area) ---- */
     case WM_LBUTTONDOWN:
+        if (d && InterlockedCompareExchange(&d->startup_visible, 0, 0) != 0)
+            return 0;
         if (d && d->mouse_in) {
             if (d->render_hwnd) SetCapture(d->render_hwnd);
             send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 1, 0);
@@ -3214,24 +3426,36 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_LBUTTONUP:
         ReleaseCapture();
+        if (d && InterlockedCompareExchange(&d->startup_visible, 0, 0) != 0)
+            return 0;
         if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 0, 0);
         return 0;
 
     case WM_RBUTTONDOWN:
+        if (d && InterlockedCompareExchange(&d->startup_visible, 0, 0) != 0)
+            return 0;
         if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 1, 0);
         return 0;
     case WM_RBUTTONUP:
+        if (d && InterlockedCompareExchange(&d->startup_visible, 0, 0) != 0)
+            return 0;
         if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_RIGHT, 0, 0);
         return 0;
 
     case WM_MBUTTONDOWN:
+        if (d && InterlockedCompareExchange(&d->startup_visible, 0, 0) != 0)
+            return 0;
         if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 1, 0);
         return 0;
     case WM_MBUTTONUP:
+        if (d && InterlockedCompareExchange(&d->startup_visible, 0, 0) != 0)
+            return 0;
         if (d && d->mouse_in) send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_MIDDLE, 0, 0);
         return 0;
 
     case WM_MOUSEWHEEL:
+        if (d && InterlockedCompareExchange(&d->startup_visible, 0, 0) != 0)
+            return 0;
         if (d && d->mouse_in) send_input(d, INPUT_MOUSE_WHEEL, (UINT32)(INT32)GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
         return 0;
 
@@ -3251,6 +3475,19 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL ext = (lp & (1 << 24)) != 0;
         BOOL up  = (msg == WM_KEYUP || msg == WM_SYSKEYUP);
         if (!d) break;
+        if (InterlockedCompareExchange(&d->startup_visible, 0, 0) != 0) {
+            if (!up && wp == VK_F12) {
+                LONG details = InterlockedCompareExchange(
+                    &d->startup_detailed, 0, 0);
+                InterlockedExchange(&d->startup_detailed, details ? 0 : 1);
+                idd_request_render(d, FALSE);
+                return 0;
+            }
+            if (msg == WM_SYSKEYDOWN && wp == VK_F4 &&
+                (GetKeyState(VK_MENU) & 0x8000) != 0)
+                break;
+            return 0;
+        }
         if (!d->transmit_hotkeys &&
             idd_is_reserved_hotkey((DWORD)wp, (GetKeyState(VK_MENU) & 0x8000) != 0))
             break;  /* Default mode: let the host handle this hotkey. */
@@ -3312,6 +3549,11 @@ VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
     d->show_debug_title   = options ? options->show_debug_title : TRUE;
     d->show_debug_overlay = options ? options->show_debug_overlay : TRUE;
     d->show_on_open       = options ? options->show_on_open : TRUE;
+    ZeroMemory(&d->window_chrome, sizeof(d->window_chrome));
+    d->window_chrome.theme = ASB_TITLE_BAR_DARK;
+    d->window_chrome.corner_preference = ASB_WINDOW_CORNER_SYSTEM;
+    if (options)
+        d->window_chrome = options->window_chrome;
     d->desired_render_width = (LONG)d->initial_width;
     d->desired_render_height = (LONG)d->initial_height;
     if (options && options->window_title)
@@ -3321,6 +3563,24 @@ VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
                   options->app_user_model_id, _TRUNCATE);
     if (options && options->icon_path)
         wcsncpy_s(d->icon_path, MAX_PATH, options->icon_path, _TRUNCATE);
+
+    if (options && options->startup.enabled) {
+        AsbStartupOptions startup = options->startup;
+        startup.app_name = startup.app_name && startup.app_name[0]
+            ? startup.app_name : d->window_title;
+        startup.mark_path = startup.mark_path && startup.mark_path[0]
+            ? startup.mark_path : d->icon_path;
+        d->startup_scene = vm_startup_scene_create(&startup);
+        if (!d->startup_scene) {
+            HeapFree(GetProcessHeap(), 0, d);
+            return NULL;
+        }
+        d->startup_enabled = TRUE;
+        d->startup_auto_ready = startup.auto_ready;
+        d->startup_phase = ASB_STARTUP_OPENING;
+        d->startup_detailed = startup.detailed ? 1 : 0;
+        d->startup_visible = 1;
+    }
 
     /* Load the per-VM display setting, creating display_settings.json with
        the default (off) if this VM doesn't have one yet. The hook itself is
@@ -3336,6 +3596,8 @@ VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
     d->frame_buf    = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                          d->frame_stride * d->frame_height);
     if (!d->frame_buf) {
+        if (d->startup_scene)
+            vm_startup_scene_destroy(d->startup_scene);
         HeapFree(GetProcessHeap(), 0, d);
         return NULL;
     }
@@ -3357,6 +3619,8 @@ VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
         DeleteCriticalSection(&d->input_send_cs);
         DeleteCriticalSection(&d->frame_cs);
         HeapFree(GetProcessHeap(), 0, d->frame_buf);
+        if (d->startup_scene)
+            vm_startup_scene_destroy(d->startup_scene);
         HeapFree(GetProcessHeap(), 0, d);
         return NULL;
     }
@@ -3371,6 +3635,8 @@ VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
         DeleteCriticalSection(&d->input_send_cs);
         DeleteCriticalSection(&d->frame_cs);
         HeapFree(GetProcessHeap(), 0, d->frame_buf);
+        if (d->startup_scene)
+            vm_startup_scene_destroy(d->startup_scene);
         HeapFree(GetProcessHeap(), 0, d);
         return NULL;
     }
@@ -3391,6 +3657,8 @@ VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
         DeleteCriticalSection(&d->input_send_cs);
         DeleteCriticalSection(&d->frame_cs);
         HeapFree(GetProcessHeap(), 0, d->frame_buf);
+        if (d->startup_scene)
+            vm_startup_scene_destroy(d->startup_scene);
         HeapFree(GetProcessHeap(), 0, d);
         return NULL;
     }
@@ -3500,6 +3768,9 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     if (display->custom_icon)
         DestroyIcon(display->custom_icon);
 
+    if (display->startup_scene)
+        vm_startup_scene_destroy(display->startup_scene);
+
     HeapFree(GetProcessHeap(), 0, display);
 }
 
@@ -3556,6 +3827,23 @@ BOOL vm_display_idd_set_resize_phase(VmDisplayIdd *display, BOOL active)
                                5000, &applied) != 0 && applied == 1;
 }
 
+BOOL vm_display_idd_set_startup_state(VmDisplayIdd *display,
+                                      AsbStartupPhase phase,
+                                      BOOL detailed)
+{
+    if (!display || !display->open || display->stop ||
+        !display->startup_enabled ||
+        phase < ASB_STARTUP_OPENING || phase > ASB_STARTUP_FAILED)
+        return FALSE;
+    InterlockedExchange(&display->startup_detailed, detailed ? 1 : 0);
+    InterlockedExchange(&display->startup_phase, (LONG)phase);
+    if (display->hwnd)
+        PostMessageW(display->hwnd, WM_IDD_STARTUP_TASKBAR,
+                     (WPARAM)phase, 0);
+    idd_request_render(display, FALSE);
+    return TRUE;
+}
+
 BOOL vm_display_idd_get_runtime_state(VmDisplayIdd *display,
                                       AsbDisplayRuntimeState *state)
 {
@@ -3575,6 +3863,12 @@ BOOL vm_display_idd_get_runtime_state(VmDisplayIdd *display,
             &display->presented_render_width, 0, 0);
     state->render_height = (UINT)InterlockedCompareExchange(
             &display->presented_render_height, 0, 0);
+    state->startup_visible = InterlockedCompareExchange(
+            &display->startup_visible, 0, 0) != 0;
+    state->startup_detailed = InterlockedCompareExchange(
+            &display->startup_detailed, 0, 0) != 0;
+    state->startup_phase = (AsbStartupPhase)InterlockedCompareExchange(
+            &display->startup_phase, 0, 0);
     EnterCriticalSection(&display->frame_cs);
     state->frame_width = display->frame_width;
     state->frame_height = display->frame_height;
