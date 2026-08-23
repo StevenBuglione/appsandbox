@@ -19,6 +19,7 @@
  *   type=2 MOUSE_WHEEL  : p1=delta (signed int32, ~120/notch)
  *   type=3 KEY          : p1=Windows VK, p2=scancode,
  *                          p3 bit0=extended, bit1=keyup (clear=keydown)
+ *   type=4 FRAME_SIZE   : p1=frame width, p2=frame height
  *
  * Build:  gcc -O2 -Wall -o appsandbox-input appsandbox-input.c
  */
@@ -39,14 +40,17 @@
 #include <linux/uinput.h>
 #include <linux/vm_sockets.h>
 
+#include "appsandbox-input-map.h"
+
 #define VSOCK_PORT          3
 #define INPUT_MAGIC         0x4E495341u  /* 'ASIN' */
-#define INPUT_READY_MAGIC   0x59445249u  /* 'IRDY' */
+#define INPUT_READY_MAGIC   0x32565249u  /* 'IRV2': accepts INPUT_FRAME_SIZE */
 
 #define INPUT_MOUSE_MOVE    0
 #define INPUT_MOUSE_BUTTON  1
 #define INPUT_MOUSE_WHEEL   2
 #define INPUT_KEY           3
+#define INPUT_FRAME_SIZE    4
 
 #define BTN_ID_LEFT         0
 #define BTN_ID_RIGHT        1
@@ -56,7 +60,7 @@
  * accept, and it can change mid-session. We pick a coordinate space
  * large enough for any plausible resolution and trust libinput to map
  * it to the active screen. 32767 is the de-facto absolute-tablet range. */
-#define ABS_RANGE   32767
+#define ABS_RANGE   ASB_INPUT_ABS_RANGE
 
 #pragma pack(push, 1)
 struct input_packet {
@@ -67,8 +71,7 @@ struct input_packet {
 #pragma pack(pop)
 
 static volatile sig_atomic_t g_stop = 0;
-static int g_frame_w = 1920;  /* updated by hint command if we add one later */
-static int g_frame_h = 1080;
+static struct asb_input_frame_size g_frame = { 1920, 1080 };
 
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
@@ -237,10 +240,8 @@ static void do_mouse_move(int ui_fd, uint32_t x, uint32_t y)
     /* Host gives us pixel coordinates in the current frame. Map to
      * 0..ABS_RANGE so the compositor scales correctly regardless of
      * the actual screen size. */
-    int32_t ax = (int32_t)((uint64_t)x * ABS_RANGE / (g_frame_w ? g_frame_w : 1));
-    int32_t ay = (int32_t)((uint64_t)y * ABS_RANGE / (g_frame_h ? g_frame_h : 1));
-    if (ax < 0) ax = 0; if (ax > ABS_RANGE) ax = ABS_RANGE;
-    if (ay < 0) ay = 0; if (ay > ABS_RANGE) ay = ABS_RANGE;
+    int32_t ax = asb_input_scale_axis(x, g_frame.width);
+    int32_t ay = asb_input_scale_axis(y, g_frame.height);
     emit(ui_fd, EV_ABS, ABS_X, ax);
     emit(ui_fd, EV_ABS, ABS_Y, ay);
     emit_syn(ui_fd);
@@ -337,6 +338,12 @@ static void serve(int client_fd, int ui_fd)
         case INPUT_MOUSE_BUTTON: do_mouse_button(ui_fd, pkt.p1, pkt.p2); break;
         case INPUT_MOUSE_WHEEL:  do_mouse_wheel(ui_fd, (int32_t)pkt.p1); break;
         case INPUT_KEY:          do_key(ui_fd, pkt.p1, pkt.p2, pkt.p3); break;
+        case INPUT_FRAME_SIZE:
+            if (asb_input_frame_size_set(&g_frame, pkt.p1, pkt.p2))
+                in_log("frame size updated to %ux%u", g_frame.width, g_frame.height);
+            else
+                in_log("ignored invalid frame size %ux%u", pkt.p1, pkt.p2);
+            break;
         default: break;
         }
     }

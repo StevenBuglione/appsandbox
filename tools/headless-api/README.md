@@ -77,7 +77,8 @@ in create-validation (wrong `osType` → `400`); the host-feature row mirrors
 | Display window (`/vms/{n}/display`) | ✅ | ✅ (daemon in a console GUI session) |
 | GPU, NAT/network modes, SSH server, SSH-key auto-deploy, SSE events | ✅ | ✅ |
 
-Only `snapshots`/`templates` are advertised in the `capabilities` object; guest
+Snapshots, templates, and prebuilt Linux disks are advertised in the
+`capabilities` object; guest
 OS is host-fixed (Windows host → Windows + Linux; macOS host → macOS + Windows), so
 a client picks its `osType` from `version()["hostOs"]`, not from `capabilities`.
 
@@ -205,6 +206,12 @@ gpuMode, networkMode, displayOpen`.
 | `delete_template(name)` | remove a template |
 | `shutdown_daemon(force=False)` | stop the daemon (refused 409 if VMs are active unless `force=True`) |
 
+`create()` also accepts `diskPath` for a prebuilt Linux `.vhdx`. Pass
+`install=false`; App Sandbox copies the appliance into the VM's private data
+directory and skips ISO installation while retaining the normal HCS, GPU-PV,
+Plan9, HvSocket, display, input, clipboard, audio, snapshot, and cleanup paths.
+`diskPath` cannot be combined with `imagePath` or `templateName`.
+
 ### Snapshots & branches *(return `(status, body)`)*
 | Method | Effect |
 |---|---|
@@ -257,6 +264,9 @@ it (good in the GUI, wrong for a CLI).
 | `display_status(name)` | `{open, ready}` — poll this; **no window is opened by polling** |
 | `display_ready(name)` | `bool` — shorthand for `display_status()["ready"]` |
 | `open_display(name)` | `(status, body)` — open (or focus) the window |
+| `resize_display(name, width, height)` | `(status, body)` — resize one open client through its owning daemon |
+| `begin_display_resize(name)` | `(status, body)` — begin one coalesced interactive resize transaction |
+| `end_display_resize(name)` | `(status, body)` — end the transaction and commit its newest guest size |
 | `close_display(name)` | `(status, body)` — close it |
 
 The pattern is **poll-then-open**:
@@ -266,6 +276,9 @@ c.start("dev")
 while not c.display_ready("dev"):    # running + agentOnline + agent says display driver up
     time.sleep(1)
 c.open_display("dev")                # a window appears on the daemon's desktop
+c.begin_display_resize("dev")        # optional: one native drag transaction
+c.resize_display("dev", 1320, 800)  # native client applied; guest convergence follows
+c.end_display_resize("dev")          # fixed backing: native resize only; legacy: final guest modeset
 ...
 c.close_display("dev")              # or the user just closes it with the [X]
 ```
@@ -283,6 +296,21 @@ c.close_display("dev")              # or the user just closes it with the [X]
   it closed — `close_display`, the window's `[X]`, VM delete, and daemon exit all
   drive it false. `open_display` on an already-open VM just focuses the window
   (foregrounding it).
+- **Resize stays process-owned.** `resize_display` accepts only an already-open
+  VM display and bounded client dimensions. The elevated daemon marshals the
+  request to that window's owning thread and returns `202` only after its client
+  rectangle exactly matches. Legacy mode coalesces and forwards the matching
+  guest display mode. Application mode may instead set `backingWidth` and
+  `backingHeight` larger than the initial client; the guest then keeps that
+  fixed 1:1 canvas while the native window clips it to its current client and
+  the application controller changes logical scene geometry independently.
+  Native client dimensions are bounded by the backing capacity.
+- **Interactive resize remains bounded.** `begin_display_resize` and
+  `end_display_resize` expose only the resize phase for that named, open VM
+  display—never an HWND or arbitrary native message. Intermediate sizes update
+  the real client rectangle and a worker coalesces swap-chain target changes.
+  Fixed-backing mode preserves 1:1 pixels and performs no drag-time guest
+  modesets; legacy mode may still converge the guest display after the resize.
 - **Local desktop only.** The window shows on the session the daemon runs in. A
   non-interactive session (a service/SSH daemon with no visible desktop) can't
   show one, so `open_display` returns `409 no_display` rather than spawning an

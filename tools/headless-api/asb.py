@@ -109,12 +109,14 @@ class Client:
     def delete_vm(self, name):return self._req("POST", "/vms/%s/delete" % name)
 
     def create(self, **cfg):
-        """Create a VM. Config keys: name, osType, imagePath|templateName, ramMb,
-        hddGb, cpuCores, gpuMode(0-2), networkMode(0-3), netAdapter, adminUser,
+        """Create a VM. Config keys: name, osType,
+        imagePath|templateName|diskPath, install, ramMb, hddGb, cpuCores,
+        gpuMode(0-2), networkMode(0-3), netAdapter, adminUser,
         adminPass, testMode, sshEnabled, sshDeployKey, isTemplate. sshDeployKey
         (requires sshEnabled) deploys the AppSandbox public key so you can SSH in
         with key auth (see key_path()); sshInfo reports keyDeployed + sshState 4
-        once it lands. The daemon validates these exactly like the GUI; ramMb is
+        once it lands. diskPath is a prebuilt Linux VHDX and requires
+        install=False. The daemon validates these exactly like the GUI; ramMb is
         rounded down to even here (2 MB-aligned, an HCS requirement, like the GUI).
         Async + auto-starts; watch status/events."""
         if isinstance(cfg.get("ramMb"), int):
@@ -134,19 +136,48 @@ class Client:
     def templates(self):         return self._req("GET", "/templates")[1].get("templates", [])
     def delete_template(self, name): return self._req("DELETE", "/templates/" + name)
     def ssh_info(self, name):    return self._req("GET", "/vms/%s/sshInfo" % name)[1]
-    def open_display(self, name):
+    def open_display(self, name, **options):
         """Open the VM's display window on the daemon's local desktop (the GUI's
         Connect view). The VM must be running, and the daemon must be in an
         interactive session that can show a window (a headless/SSH/service daemon
         returns 409 "no_display"). Returns (status, body); status() reports
-        displayOpen, which also goes false if the user closes the window."""
-        return self._req("POST", "/vms/%s/display" % name)
+        displayOpen, which also goes false if the user closes the window.
+
+        Application mode accepts mode="application", title, width, height,
+        backingWidth, backingHeight, minimumWidth, minimumHeight,
+        appUserModelId, iconPath. A backing size larger than the initial client
+        keeps a fixed 1:1 guest canvas while the native window is clipped and
+        resized within that capacity. Application mode also accepts
+        showDebugTitle, showDebugOverlay, and showOnOpen. A controller may set
+        showOnOpen=False and reveal the existing display with open_display(name)
+        after its logical scene is ready. With no options this preserves the
+        normal App Sandbox display window."""
+        return self._req("POST", "/vms/%s/display" % name, options or None)
     def close_display(self, name): return self._req("DELETE", "/vms/%s/display" % name)
+    def resize_display(self, name, width, height):
+        """Resize one already-open display client through its owning daemon."""
+        return self._req("PUT", "/vms/%s/display" % name,
+                         {"width": width, "height": height})
+    def begin_display_resize(self, name):
+        """Begin one coalesced interactive resize of an open display."""
+        return self._req("PUT", "/vms/%s/display" % name, {"phase": "begin"})
+    def end_display_resize(self, name):
+        """End the resize and commit its newest geometry to the guest once."""
+        return self._req("PUT", "/vms/%s/display" % name, {"phase": "end"})
+    def click_display(self, name, x, y):
+        """Click one bounded guest-frame point through the open display."""
+        return self._req("PUT", "/vms/%s/display" % name,
+                         {"input": "click", "x": x, "y": y})
+    def drag_display(self, name, x, y, end_x, end_y, steps=24):
+        """Drag between two bounded guest-frame points through the open display."""
+        return self._req("PUT", "/vms/%s/display" % name,
+                         {"input": "drag", "x": x, "y": y,
+                          "endX": end_x, "endY": end_y, "steps": steps})
     def display_status(self, name):
-        """{'open': bool, 'ready': bool}. 'ready' is the agent's own report that the
-        display driver is up (running + agentOnline + idd_status) -- a passive flag,
-        NOT a probe: polling it touches no window and no frame channel, so it can't
-        disturb the display. Wait for ready, then call open_display()."""
+        """Pollable passive display state. An open display also reports monotonic
+        receivedFrames, presentedFrames, and presentCount. renderWidth/renderHeight
+        are the last successful native presentation; frame geometry is the latest
+        guest frame. Reading it touches no window and no frame channel."""
         return self._req("GET", "/vms/%s/display" % name)[1]
     def display_ready(self, name):  return bool(self.display_status(name).get("ready"))
     def snapshots(self, name):   return self._req("GET", "/vms/%s/snapshots" % name)[1].get("snapshots", [])

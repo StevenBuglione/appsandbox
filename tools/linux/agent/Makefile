@@ -13,7 +13,8 @@ SYSTEMDDIR    := /etc/systemd/system
 USERUNITDIR   := /etc/systemd/user
 
 # Daemons get added here as each phase lands.
-BINS := appsandbox-agent appsandbox-display appsandbox-input appsandbox-audio appsandbox-clipboard
+BINS := appsandbox-agent appsandbox-display appsandbox-input appsandbox-audio appsandbox-clipboard \
+        appsandbox-mutter-resize
 
 SYSTEM_UNITS := systemd/appsandbox-agent.service \
                 systemd/appsandbox-display.service \
@@ -30,13 +31,23 @@ all: $(BINS)
 appsandbox-agent: appsandbox-agent.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+appsandbox-mutter-resize: appsandbox-mutter-resize.c
+	$(CC) $(CFLAGS) $(shell pkg-config --cflags gio-2.0) -o $@ $< \
+	       $(LDFLAGS) $(shell pkg-config --libs gio-2.0) -lm
+
 # Display daemon needs libdrm for drmModeGetFB2 + drmPrimeHandleToFD.
 appsandbox-display: appsandbox-display.c
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags libdrm) -o $@ $< \
 	       $(LDFLAGS) $(shell pkg-config --libs libdrm)
 
-appsandbox-input: appsandbox-input.c
+appsandbox-input: appsandbox-input.c appsandbox-input-map.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+test-input-map: tests/test-input-map.c appsandbox-input-map.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+test: test-input-map
+	./test-input-map
 
 # Audio daemon uses libasound to talk to the kernel snd-aloop driver.
 appsandbox-audio: appsandbox-audio.c
@@ -75,6 +86,6 @@ disable:
 	-systemctl disable --now appsandbox-agent.service
 
 clean:
-	rm -f $(BINS)
+	rm -f $(BINS) test-input-map
 
-.PHONY: all install enable disable clean
+.PHONY: all install enable disable clean test

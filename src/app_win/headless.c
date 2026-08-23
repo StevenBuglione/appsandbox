@@ -467,14 +467,16 @@ static void trim_ws(wchar_t *s)
 static const char *validate_create(const wchar_t *name, const wchar_t *os,
                                    const wchar_t *user, const wchar_t *pass,
                                    const wchar_t *tpl, const wchar_t *img,
+                                   const wchar_t *disk,
                                    BOOL is_template, int ram_mb, int hdd_gb,
                                    int cpu_cores, int gpu_mode, int net_mode)
 {
-    int i, len; BOOL is_linux, is_win, all_digits, from_template;
+    int i, len; BOOL is_linux, is_win, all_digits, from_template, from_disk;
 
     is_linux = (_wcsicmp(os, L"Linux") == 0);
     is_win   = (_wcsicmp(os, L"Windows") == 0);
     from_template = (tpl && tpl[0] != L'\0');
+    from_disk = (disk && disk[0] != L'\0');
 
     /* name / hostname */
     if (!name || !name[0]) return "VM name is required.";
@@ -501,13 +503,19 @@ static const char *validate_create(const wchar_t *name, const wchar_t *os,
     }
 
     /* image-or-template required; template constraints */
-    if (!from_template && (!img || !img[0])) return "An image (ISO) or template is required.";
+    if (!from_template && !from_disk && (!img || !img[0]))
+        return "An image (ISO), prebuilt disk, or template is required.";
+    if (from_disk && (from_template || (img && img[0])))
+        return "diskPath cannot be combined with imagePath or templateName.";
+    if (from_disk && !is_linux)
+        return "Prebuilt disks are supported only for Linux VMs.";
     if (is_template && from_template)        return "Cannot create a template from another template.";
+    if (is_template && from_disk)            return "Cannot create a template from a prebuilt disk.";
     if (is_template && !is_win)              return "Templates are only supported for Windows.";
 
     /* username / password -- GUI validates on a normal create (onCreateVm) but
        not on a template build (onCreateTemplate); match that. */
-    if (!is_template) {
+    if (!is_template && !from_disk) {
         if (!user || !user[0]) return "Username is required.";
         len = (int)wcslen(user);
         if (is_linux) {
@@ -570,7 +578,8 @@ static int handle_request(PHTTP_REQUEST req)
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/version") == 0) {
         sprintf_s(buf, sizeof(buf),
             "{\"product\":\"AppSandbox\",\"version\":\"%s\",\"apiVersion\":\"%s\",\"hostOs\":\"Windows\","
-            "\"capabilities\":{\"snapshots\":true,\"templates\":true}}",
+            "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"prebuiltLinuxDisk\":true,"
+            "\"applicationDisplay\":true}}",
             ASB_PRODUCT_VER, ASB_API_VERSION);
         send_json(req->RequestId, 200, "OK", buf);
         return 0;
@@ -641,20 +650,23 @@ static int handle_request(PHTTP_REQUEST req)
             /* create */
             wchar_t body[8192];
             AsbVmConfig cfg; int iv; BOOL bv;
-            wchar_t name[256]={0}, os[32]={0}, img[MAX_PATH]={0}, tpl[256]={0};
+            wchar_t name[256]={0}, os[32]={0}, img[MAX_PATH]={0}, disk[MAX_PATH]={0}, tpl[256]={0};
             wchar_t user[128]={0}, pass[128]={0}, adapter[256]={0};
+            BOOL install_present = FALSE, install_requested = FALSE;
             char nu[256]={0};
             body_to_wide(req, body, 8192);
             ZeroMemory(&cfg, sizeof(cfg));
             json_get_string(body, L"name", name, 256);
             json_get_string(body, L"osType", os, 32);
             json_get_string(body, L"imagePath", img, MAX_PATH);
+            json_get_string(body, L"diskPath", disk, MAX_PATH);
             json_get_string(body, L"templateName", tpl, 256);
             json_get_string(body, L"adminUser", user, 128);
             json_get_string(body, L"adminPass", pass, 128);
             json_get_string(body, L"netAdapter", adapter, 256);
             trim_ws(name); trim_ws(user);   /* match the GUI's .value.trim() */
             cfg.name = name; cfg.os_type = os; cfg.image_path = img;
+            cfg.disk_path = disk;
             cfg.template_name = tpl; cfg.username = user; cfg.password = pass;
             cfg.net_adapter = adapter;
             if (json_get_int(body, L"ramMb", &iv)) cfg.ram_mb = (DWORD)iv;
@@ -666,13 +678,22 @@ static int handle_request(PHTTP_REQUEST req)
             if (json_get_bool(body, L"sshEnabled", &bv)) cfg.ssh_enabled = bv;
             if (json_get_bool(body, L"sshDeployKey", &bv)) cfg.ssh_deploy_key = bv;
             if (json_get_bool(body, L"isTemplate", &bv)) cfg.is_template = bv;
+            if (json_get_bool(body, L"install", &bv)) {
+                install_present = TRUE;
+                install_requested = bv;
+            }
+            if (disk[0] && (!install_present || install_requested)) {
+                send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                         "diskPath requires install=false");
+                return 0;
+            }
             if (cfg.ssh_deploy_key && !cfg.ssh_enabled) {
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                          "sshDeployKey requires sshEnabled");
                 return 0;
             }
             {
-                const char *verr = validate_create(name, os, user, pass, tpl, img,
+                const char *verr = validate_create(name, os, user, pass, tpl, img, disk,
                     cfg.is_template, (int)cfg.ram_mb, (int)cfg.hdd_gb, (int)cfg.cpu_cores,
                     cfg.gpu_mode, cfg.network_mode);
                 if (verr) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", verr); return 0; }
@@ -820,6 +841,96 @@ static int handle_request(PHTTP_REQUEST req)
             display_reap_stale(v->unique_id);   /* drop a self-closed (X) display first */
             if (verb == HttpVerbPOST) {
                 DisplayEntry *e;
+                AsbDisplayOptions display_options;
+                wchar_t body[2048];
+                wchar_t mode[32] = {0};
+                wchar_t title[256] = L"Linguum Runtime POC";
+                wchar_t app_id[256] = L"com.linguum.Runtime.POC";
+                wchar_t icon_path[MAX_PATH] = {0};
+                int iv;
+                BOOL bv;
+
+                ZeroMemory(&display_options, sizeof(display_options));
+                body_to_wide(req, body, 2048);
+                json_get_string(body, L"mode", mode, 32);
+                trim_ws(mode);
+                if (mode[0] && _wcsicmp(mode, L"application") != 0 &&
+                    _wcsicmp(mode, L"display") != 0) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "mode must be 'application' or 'display'");
+                    return 0;
+                }
+                display_options.app_mode = _wcsicmp(mode, L"application") == 0;
+                display_options.initial_width = display_options.app_mode ? 1440 : 1920;
+                display_options.initial_height = display_options.app_mode ? 900 : 1080;
+                display_options.minimum_width = display_options.app_mode ? 800 : 320;
+                display_options.minimum_height = display_options.app_mode ? 500 : 180;
+                display_options.show_debug_title = !display_options.app_mode;
+                display_options.show_debug_overlay = !display_options.app_mode;
+                display_options.show_on_open = TRUE;
+
+                json_get_string(body, L"title", title, 256);
+                json_get_string(body, L"appUserModelId", app_id, 256);
+                json_get_string(body, L"iconPath", icon_path, MAX_PATH);
+                if (json_get_int(body, L"width", &iv))
+                    display_options.initial_width = (UINT)iv;
+                if (json_get_int(body, L"height", &iv))
+                    display_options.initial_height = (UINT)iv;
+                if (json_get_int(body, L"backingWidth", &iv))
+                    display_options.backing_width = (UINT)iv;
+                if (json_get_int(body, L"backingHeight", &iv))
+                    display_options.backing_height = (UINT)iv;
+                if (json_get_int(body, L"minimumWidth", &iv))
+                    display_options.minimum_width = (UINT)iv;
+                if (json_get_int(body, L"minimumHeight", &iv))
+                    display_options.minimum_height = (UINT)iv;
+                if (json_get_bool(body, L"showDebugTitle", &bv))
+                    display_options.show_debug_title = bv;
+                if (json_get_bool(body, L"showDebugOverlay", &bv))
+                    display_options.show_debug_overlay = bv;
+                if (json_get_bool(body, L"showOnOpen", &bv))
+                    display_options.show_on_open = bv;
+                trim_ws(title);
+                trim_ws(app_id);
+                trim_ws(icon_path);
+
+                if (display_options.initial_width < 320 ||
+                    display_options.initial_height < 180 ||
+                    display_options.initial_width > 7680 ||
+                    display_options.initial_height > 4320 ||
+                    display_options.minimum_width < 320 ||
+                    display_options.minimum_height < 180 ||
+                    display_options.minimum_width > display_options.initial_width ||
+                    display_options.minimum_height > display_options.initial_height ||
+                    ((display_options.backing_width == 0) !=
+                     (display_options.backing_height == 0)) ||
+                    (display_options.backing_width != 0 &&
+                     (!display_options.app_mode ||
+                      display_options.backing_width < display_options.initial_width ||
+                      display_options.backing_height < display_options.initial_height ||
+                      display_options.backing_width > 7680 ||
+                      display_options.backing_height > 4320))) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "display dimensions are outside the supported range");
+                    return 0;
+                }
+                if (display_options.app_mode && !title[0]) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "application mode requires a non-empty title");
+                    return 0;
+                }
+                if (icon_path[0] &&
+                    !((wcslen(icon_path) >= 3 && icon_path[1] == L':' &&
+                       (icon_path[2] == L'\\' || icon_path[2] == L'/')) ||
+                      (icon_path[0] == L'\\' && icon_path[1] == L'\\'))) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "iconPath must be absolute");
+                    return 0;
+                }
+                display_options.window_title = title;
+                display_options.app_user_model_id = app_id;
+                display_options.icon_path = icon_path;
+
                 if (!host_can_show_window()) {
                     send_err(req->RequestId, 409, "Conflict", "no_display",
                              "no local interactive desktop is available to show the window "
@@ -842,7 +953,11 @@ static int handle_request(PHTTP_REQUEST req)
                 }
                 e = display_find(v->unique_id);   /* present => still open (a closed one was reaped above) */
                 if (e) {
-                    vm_display_idd_focus(e->disp);            /* already open -> bring to front */
+                    if (!vm_display_idd_focus(e->disp)) {
+                        send_err(req->RequestId, 409, "Conflict", "display_focus_failed",
+                                 "the owned display did not process the focus request");
+                        return 0;
+                    }
                 } else {
                     int slot; for (slot = 0; slot < ASB_MAX_VMS && g_displays[slot].vm_id; slot++) {}
                     if (slot == ASB_MAX_VMS) {
@@ -851,7 +966,8 @@ static int handle_request(PHTTP_REQUEST req)
                         return 0;
                     }
                     e = &g_displays[slot];
-                    e->disp = vm_display_idd_create(v, g_hinst, NULL);
+                    e->disp = vm_display_idd_create_ex(v, g_hinst, NULL,
+                                                       &display_options);
                     if (!e->disp) {
                         e->vm_id = 0;
                         send_err(req->RequestId, 500, "Internal Server Error", "display_failed",
@@ -861,6 +977,104 @@ static int handle_request(PHTTP_REQUEST req)
                     e->vm_id = v->unique_id;
                 }
                 send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"displayOpen\":true}");
+                return 0;
+            }
+            if (verb == HttpVerbPUT) {
+                DisplayEntry *e = display_find(v->unique_id);
+                wchar_t body[512];
+                wchar_t phase[16] = L"";
+                wchar_t input[16] = L"";
+                int width = 0, height = 0;
+                if (!e || !e->disp) {
+                    send_err(req->RequestId, 409, "Conflict", "display_not_open",
+                             "the VM display must be open before it can be resized");
+                    return 0;
+                }
+                body_to_wide(req, body, 512);
+                if (json_get_string(body, L"input", input, 16)) {
+                    int x = 0, y = 0, end_x = 0, end_y = 0, steps = 0;
+                    if (!json_get_int(body, L"x", &x) || !json_get_int(body, L"y", &y) ||
+                        x < 0 || y < 0 || x > 7679 || y > 4319) {
+                        send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                                 "display input coordinates are missing or outside the supported range");
+                        return 0;
+                    }
+                    if (_wcsicmp(input, L"click") == 0) {
+                        if (!vm_display_idd_pointer_click(e->disp, (UINT)x, (UINT)y)) {
+                            send_err(req->RequestId, 409, "Conflict", "display_input_failed",
+                                     "the owned display input channel is unavailable or the point is outside its frame");
+                            return 0;
+                        }
+                        send_json(req->RequestId, 202, "Accepted",
+                                  "{\"ok\":true,\"displayOpen\":true,\"input\":\"click\",\"inputApplied\":true}");
+                        return 0;
+                    }
+                    if (_wcsicmp(input, L"drag") != 0 ||
+                        !json_get_int(body, L"endX", &end_x) ||
+                        !json_get_int(body, L"endY", &end_y) ||
+                        !json_get_int(body, L"steps", &steps) ||
+                        end_x < 0 || end_y < 0 || end_x > 7679 || end_y > 4319 ||
+                        steps < 2 || steps > 120) {
+                        send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                                 "display drag requires bounded end coordinates and 2..120 steps");
+                        return 0;
+                    }
+                    if (!vm_display_idd_pointer_drag(e->disp, (UINT)x, (UINT)y,
+                                                     (UINT)end_x, (UINT)end_y,
+                                                     (UINT)steps)) {
+                        send_err(req->RequestId, 409, "Conflict", "display_input_failed",
+                                 "the owned display input channel is unavailable or the drag is outside its frame");
+                        return 0;
+                    }
+                    send_json(req->RequestId, 202, "Accepted",
+                              "{\"ok\":true,\"displayOpen\":true,\"input\":\"drag\",\"inputApplied\":true}");
+                    return 0;
+                }
+                if (json_get_string(body, L"phase", phase, 16)) {
+                    BOOL active;
+                    if (_wcsicmp(phase, L"begin") == 0) {
+                        active = TRUE;
+                    } else if (_wcsicmp(phase, L"end") == 0) {
+                        active = FALSE;
+                    } else {
+                        send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                                 "display resize phase must be 'begin' or 'end'");
+                        return 0;
+                    }
+                    if (!vm_display_idd_set_resize_phase(e->disp, active)) {
+                        send_err(req->RequestId, 500, "Internal Server Error",
+                                 "display_resize_phase_failed",
+                                 "the owned native display did not apply the resize phase");
+                        return 0;
+                    }
+                    if (active) {
+                        send_json(req->RequestId, 202, "Accepted",
+                                  "{\"ok\":true,\"displayOpen\":true,"
+                                  "\"resizePhase\":\"begin\",\"resizePhaseApplied\":true}");
+                    } else {
+                        send_json(req->RequestId, 202, "Accepted",
+                                  "{\"ok\":true,\"displayOpen\":true,"
+                                  "\"resizePhase\":\"end\",\"resizePhaseApplied\":true}");
+                    }
+                    return 0;
+                }
+                if (!json_get_int(body, L"width", &width) ||
+                    !json_get_int(body, L"height", &height) ||
+                    width < 320 || height < 180 ||
+                    width > 7680 || height > 4320) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "display resize dimensions are missing or outside the supported range");
+                    return 0;
+                }
+                if (!vm_display_idd_resize(e->disp, (UINT)width, (UINT)height)) {
+                    send_err(req->RequestId, 500, "Internal Server Error",
+                             "display_resize_failed",
+                             "the owned native display did not apply the requested client size");
+                    return 0;
+                }
+                send_json(req->RequestId, 202, "Accepted",
+                          "{\"ok\":true,\"displayOpen\":true,\"resizeAccepted\":true,"
+                          "\"nativeResizeApplied\":true}");
                 return 0;
             }
             if (verb == HttpVerbDELETE) {
@@ -873,16 +1087,31 @@ static int handle_request(PHTTP_REQUEST req)
                    asb_vm_idd_ready: running + agent-online + the agent's latched
                    idd_status flag, so a client can poll this on an interval (it disturbs
                    nothing) and POST to open once ready. */
-                char b[160];
-                BOOL open = display_is_open(v->unique_id);
+                char b[512];
+                DisplayEntry *e = display_find(v->unique_id);
+                BOOL open = e && e->disp && vm_display_idd_is_open(e->disp);
                 BOOL ready = open || asb_vm_idd_ready(vm);
-                sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s}",
-                          open ? "true" : "false", ready ? "true" : "false");
+                AsbDisplayRuntimeState state;
+                if (open && vm_display_idd_get_runtime_state(e->disp, &state)) {
+                    sprintf_s(b, sizeof(b),
+                              "{\"open\":true,\"ready\":true,"
+                              "\"receivedFrames\":%llu,\"presentedFrames\":%llu,"
+                              "\"presentCount\":%llu,\"guestFrameSequence\":%llu,"
+                              "\"renderWidth\":%u,\"renderHeight\":%u,"
+                              "\"frameWidth\":%u,\"frameHeight\":%u}",
+                              state.received_frames, state.presented_frames,
+                              state.present_count, state.guest_frame_sequence,
+                              state.render_width, state.render_height,
+                              state.frame_width, state.frame_height);
+                } else {
+                    sprintf_s(b, sizeof(b), "{\"open\":false,\"ready\":%s}",
+                              ready ? "true" : "false");
+                }
                 send_json(req->RequestId, 200, "OK", b);
                 return 0;
             }
             send_err(req->RequestId, 405, "Method Not Allowed", "method",
-                     "use GET to poll state, POST to open the display, DELETE to close it");
+                     "use GET to poll state, POST to open, PUT to resize, DELETE to close the display");
             return 0;
         }
 

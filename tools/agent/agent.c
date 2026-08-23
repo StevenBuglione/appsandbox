@@ -1988,14 +1988,16 @@ static void handle_client(AsbConn *client)
                     CloseHandle(pi.hThread);
                 }
 
-                /* Set DNS to gateway (host NAT) + 8.8.8.8 fallback */
+                /* The HCN NAT gateway routes packets but does not proxy DNS.
+                   Use reachable resolvers directly so uncached lookups do not
+                   wait for the gateway to time out. */
                 if (exit_code == 0) {
                     wchar_t dns_cmd[512];
                     STARTUPINFOW si2;
                     PROCESS_INFORMATION pi2;
 
                     swprintf_s(dns_cmd, 512,
-                        L"netsh interface ip set dns \"Ethernet\" static %S", gateway);
+                        L"netsh interface ip set dns \"Ethernet\" static 8.8.8.8");
                     ZeroMemory(&si2, sizeof(si2));
                     si2.cb = sizeof(si2);
                     ZeroMemory(&pi2, sizeof(pi2));
@@ -2007,7 +2009,7 @@ static void handle_client(AsbConn *client)
                     }
 
                     swprintf_s(dns_cmd, 512,
-                        L"netsh interface ip add dns \"Ethernet\" 8.8.8.8 index=2");
+                        L"netsh interface ip add dns \"Ethernet\" 1.1.1.1 index=2");
                     ZeroMemory(&si2, sizeof(si2));
                     si2.cb = sizeof(si2);
                     ZeroMemory(&pi2, sizeof(pi2));
@@ -2018,8 +2020,8 @@ static void handle_client(AsbConn *client)
                         CloseHandle(pi2.hThread);
                     }
 
-                    agent_log("IP configured: %s/%s gw %s dns %s,8.8.8.8",
-                              ip, prefix, gateway, gateway);
+                    agent_log("IP configured: %s/%s gw %s dns 8.8.8.8,1.1.1.1",
+                              ip, prefix, gateway);
                     REPLY("ok");
                 } else {
                     agent_log("netsh failed (exit %lu)", exit_code);

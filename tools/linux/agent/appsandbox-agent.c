@@ -48,6 +48,16 @@
 #define HEARTBEAT_INTERVAL_SEC  5
 #define LINE_BUF_MAX            4096
 #define REPLY_MAX               256
+#define DISPLAY_MIN_WIDTH       64u
+#define DISPLAY_MIN_HEIGHT      64u
+#define DISPLAY_MAX_WIDTH       7680u
+#define DISPLAY_MAX_HEIGHT      4320u
+#define DISPLAY_REFRESH         60u
+#define ASB_DRM_MODE_PATH       "/sys/devices/platform/asb_drm.0/mode"
+#define MUTTER_RESIZE_HELPER    "/usr/local/bin/appsandbox-mutter-resize"
+#define WLR_RANDR_HELPER        "wlr-randr"
+#define ASB_DRM_OUTPUT_NAME     "Virtual-1"
+#define HYPERV_OUTPUT_NAME      "Virtual-2"
 
 /* ---- Global state for the currently-active client connection ---- */
 
@@ -208,6 +218,30 @@ static void find_mutter_xauth(uid_t uid, char *out, size_t cap)
     closedir(d);
 }
 
+/* Find a live Wayland compositor socket for a user. Unlike the Mutter XWayland
+ * cookie above, this also works for the deliberately X11-free Cage appliance. */
+static void find_wayland_socket(uid_t uid, char *out, size_t cap)
+{
+    char xdg_rt[64];
+    snprintf(xdg_rt, sizeof(xdg_rt), "/run/user/%u", (unsigned)uid);
+    DIR *d = opendir(xdg_rt);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        char path[512];
+        struct stat st;
+
+        if (strncmp(de->d_name, "wayland-", 8) != 0)
+            continue;
+        snprintf(path, sizeof(path), "%s/%s", xdg_rt, de->d_name);
+        if (stat(path, &st) == 0 && S_ISSOCK(st.st_mode)) {
+            snprintf(out, cap, "%s", path);
+            break;
+        }
+    }
+    closedir(d);
+}
+
 /* True if the UID looks like a regular human user we can spawn the
  * clipboard helper as — has a /home/... directory and a real login shell.
  *
@@ -231,13 +265,12 @@ static int uid_is_real_user(uid_t uid)
     return 1;
 }
 
-/* Scan /run/user for the UID whose runtime dir has a Mutter XWayland auth
- * cookie AND who looks like a real user (not gdm). That's the user whose
- * graphical session we want to spawn the clipboard helper into. Returns
- * 0 (not found) or a valid uid_t.
+/* Scan /run/user for the UID whose runtime dir has either a Mutter XWayland
+ * auth cookie or a live Wayland socket and who looks like a real user (not
+ * gdm). Returns 0 (not found) or a valid uid_t.
  *
  * We can't hardcode a username — the create-VM modal lets the user pick
- * any account name. Looking for the live mutter xauth file is more robust
+ * any account name. Looking for a live compositor endpoint is more robust
  * than parsing /etc/passwd because it implicitly filters for "user who
  * actually has a graphical session right now". */
 static uid_t find_graphical_session_uid(void)
@@ -253,23 +286,28 @@ static uid_t find_graphical_session_uid(void)
         if (!end || *end != '\0' || v < 1000 || v >= 65534) continue;
         if (!uid_is_real_user((uid_t)v)) continue;
         char xauth[512] = {0};
+        char wayland[512] = {0};
         find_mutter_xauth((uid_t)v, xauth, sizeof(xauth));
-        if (xauth[0]) { found = (uid_t)v; break; }
+        find_wayland_socket((uid_t)v, wayland, sizeof(wayland));
+        if (xauth[0] || wayland[0]) { found = (uid_t)v; break; }
     }
     closedir(d);
     return found;
 }
 
-/* User session is "ready" once Mutter has dropped its XWayland auth
- * cookie. Before that, xcb_connect would fail with the no-auth-protocol
- * error we saw on early spawns. */
+/* A compositor session is ready once either Mutter has dropped its XWayland
+ * cookie or a compositor has published a Wayland socket. */
 static int is_user_session_ready(uid_t uid)
 {
     char xauth[512] = {0};
-    find_mutter_xauth(uid, xauth, sizeof(xauth));
-    if (xauth[0] == '\0') return 0;
+    char wayland[512] = {0};
     struct stat st;
-    return stat(xauth, &st) == 0 && S_ISREG(st.st_mode);
+
+    find_mutter_xauth(uid, xauth, sizeof(xauth));
+    if (xauth[0] && stat(xauth, &st) == 0 && S_ISREG(st.st_mode))
+        return 1;
+    find_wayland_socket(uid, wayland, sizeof(wayland));
+    return wayland[0] && stat(wayland, &st) == 0 && S_ISSOCK(st.st_mode);
 }
 
 static void kill_clipboard_helper_locked(void)
@@ -314,6 +352,17 @@ static void spawn_clipboard_helper_locked(void)
     if (!is_user_session_ready(pw->pw_uid)) {
         /* Will retry on the next monitor tick. */
         return;
+    }
+
+    /* The current clipboard bridge is XCB-based and relies on Mutter's
+     * XWayland bridge. A pure Cage session is still display-ready, but must
+     * not crash-loop this helper until a native Wayland clipboard bridge is
+     * supplied. */
+    {
+        char xauth[512] = {0};
+        find_mutter_xauth(pw->pw_uid, xauth, sizeof(xauth));
+        if (xauth[0] == '\0')
+            return;
     }
 
     int writer_fd = vsock_bind_listen_privileged(5);
@@ -483,6 +532,188 @@ static void *heartbeat_thread(void *arg)
 
 /* ---- Command handlers ---- */
 
+static int apply_mutter_display_mode(unsigned int width, unsigned int height)
+{
+    uid_t uid = find_graphical_session_uid();
+    struct passwd *pw;
+    pid_t pid;
+    int status;
+    char width_arg[16];
+    char height_arg[16];
+
+    if (uid == 0 || !is_user_session_ready(uid))
+        return -1;
+    pw = getpwuid(uid);
+    if (!pw)
+        return -1;
+
+    snprintf(width_arg, sizeof(width_arg), "%u", width);
+    snprintf(height_arg, sizeof(height_arg), "%u", height);
+    pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        char xdg_runtime[64];
+        char session_bus[96];
+
+        if (setgid(pw->pw_gid) < 0 ||
+            initgroups(pw->pw_name, pw->pw_gid) < 0 ||
+            setuid(pw->pw_uid) < 0)
+            _exit(126);
+
+        snprintf(xdg_runtime, sizeof(xdg_runtime), "/run/user/%u",
+                 (unsigned)pw->pw_uid);
+        snprintf(session_bus, sizeof(session_bus), "unix:path=%s/bus",
+                 xdg_runtime);
+        setenv("HOME", pw->pw_dir, 1);
+        setenv("USER", pw->pw_name, 1);
+        setenv("LOGNAME", pw->pw_name, 1);
+        setenv("XDG_RUNTIME_DIR", xdg_runtime, 1);
+        setenv("DBUS_SESSION_BUS_ADDRESS", session_bus, 1);
+
+        execl(MUTTER_RESIZE_HELPER, "appsandbox-mutter-resize",
+              width_arg, height_arg, (char *)NULL);
+        _exit(127);
+    }
+
+    if (waitpid(pid, &status, 0) < 0)
+        return -1;
+    if (!WIFEXITED(status))
+        return -1;
+    return WEXITSTATUS(status);
+}
+
+/* Cage exposes zwlr_output_manager_v1. Apply the new asb_drm mode through
+ * that protocol, keeping the firmware Hyper-V output out of the one-surface
+ * appliance layout. */
+static int apply_wlroots_display_mode(unsigned int width, unsigned int height)
+{
+    uid_t uid = find_graphical_session_uid();
+    struct passwd *pw;
+    pid_t pid;
+    int status;
+    char mode_arg[40];
+    char wayland_socket[512] = {0};
+    const char *wayland_name;
+
+    if (uid == 0)
+        return -1;
+    find_wayland_socket(uid, wayland_socket, sizeof(wayland_socket));
+    if (wayland_socket[0] == '\0')
+        return -1;
+    pw = getpwuid(uid);
+    if (!pw)
+        return -1;
+
+    wayland_name = strrchr(wayland_socket, '/');
+    wayland_name = wayland_name ? wayland_name + 1 : wayland_socket;
+    snprintf(mode_arg, sizeof(mode_arg), "%ux%u@%uHz", width, height,
+             DISPLAY_REFRESH);
+
+    pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        char xdg_runtime[64];
+
+        if (setgid(pw->pw_gid) < 0 ||
+            initgroups(pw->pw_name, pw->pw_gid) < 0 ||
+            setuid(pw->pw_uid) < 0)
+            _exit(126);
+
+        snprintf(xdg_runtime, sizeof(xdg_runtime), "/run/user/%u",
+                 (unsigned)pw->pw_uid);
+        setenv("HOME", pw->pw_dir, 1);
+        setenv("USER", pw->pw_name, 1);
+        setenv("LOGNAME", pw->pw_name, 1);
+        setenv("XDG_RUNTIME_DIR", xdg_runtime, 1);
+        setenv("WAYLAND_DISPLAY", wayland_name, 1);
+
+        execlp(WLR_RANDR_HELPER, WLR_RANDR_HELPER,
+               "--output", ASB_DRM_OUTPUT_NAME,
+               "--custom-mode", mode_arg,
+               "--pos", "0,0",
+               "--output", HYPERV_OUTPUT_NAME,
+               "--off", (char *)NULL);
+        _exit(127);
+    }
+
+    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status))
+        return -1;
+    return WEXITSTATUS(status);
+}
+
+static int apply_session_display_mode(unsigned int width, unsigned int height)
+{
+    uid_t uid = find_graphical_session_uid();
+    char xauth[512] = {0};
+
+    if (uid == 0)
+        return -1;
+    find_mutter_xauth(uid, xauth, sizeof(xauth));
+    if (xauth[0])
+        return apply_mutter_display_mode(width, height);
+    return apply_wlroots_display_mode(width, height);
+}
+
+static void handle_display_resize(int fd, const char *tag, const char *args)
+{
+    unsigned int width, height, refresh;
+    char extra;
+    char mode[32];
+    int mode_fd;
+    int mode_len;
+    ssize_t written;
+
+    if (sscanf(args, "%ux%u@%u%c", &width, &height, &refresh, &extra) != 3) {
+        send_reply(fd, tag, "error:bad_display_mode");
+        return;
+    }
+    if (width < DISPLAY_MIN_WIDTH || width > DISPLAY_MAX_WIDTH ||
+        height < DISPLAY_MIN_HEIGHT || height > DISPLAY_MAX_HEIGHT ||
+        refresh != DISPLAY_REFRESH) {
+        send_reply(fd, tag, "error:unsupported_display_mode");
+        return;
+    }
+
+    mode_len = snprintf(mode, sizeof(mode), "%ux%u@%u", width, height, refresh);
+    if (mode_len <= 0 || (size_t)mode_len >= sizeof(mode)) {
+        send_reply(fd, tag, "error:bad_display_mode");
+        return;
+    }
+
+    mode_fd = open(ASB_DRM_MODE_PATH, O_WRONLY | O_CLOEXEC);
+    if (mode_fd < 0) {
+        agent_log("display_resize: open %s failed: %s",
+                  ASB_DRM_MODE_PATH, strerror(errno));
+        send_reply(fd, tag, "error:mode_unavailable");
+        return;
+    }
+
+    written = write(mode_fd, mode, (size_t)mode_len);
+    if (close(mode_fd) != 0 && written == mode_len)
+        written = -1;
+    if (written != mode_len) {
+        agent_log("display_resize: write %s failed: %s",
+                  mode, strerror(errno));
+        send_reply(fd, tag, "error:mode_write_failed");
+        return;
+    }
+
+    agent_log("display_resize: requested %s", mode);
+    {
+        int session_result = apply_session_display_mode(width, height);
+        if (session_result != 0) {
+            agent_log("display_resize: compositor apply %ux%u failed (exit=%d)",
+                      width, height, session_result);
+            send_reply(fd, tag, "error:session_mode_failed");
+            return;
+        }
+    }
+    agent_log("display_resize: compositor applied %ux%u", width, height);
+    send_reply(fd, tag, "ok");
+}
+
 /* set_ip:<ip>/<prefix>:<gw>
  *   e.g. set_ip:192.168.42.2/24:192.168.42.1
  *
@@ -492,8 +723,9 @@ static void *heartbeat_thread(void *arg)
  *   2. Remove every other *.yaml in /etc/netplan so the merge has only
  *      our file to consider — no coexistence games.
  *   3. Write /etc/netplan/99-appsandbox.yaml with the host-assigned
- *      address + gateway + DNS (gateway primary, 8.8.8.8 fallback —
- *      same DNS layout the Windows agent uses).
+ *      address + gateway + reachable DNS resolvers. The HCN NAT gateway
+ *      routes packets but does not provide a DNS proxy, so advertising it as
+ *      a resolver adds a multi-second timeout to every uncached lookup.
  *   4. `netplan apply` then `systemctl restart systemd-networkd` so the
  *      kernel actually drops any stale addresses from a prior config.
  *
@@ -504,7 +736,7 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
     const char *slash  = strchr(args, '/');
     const char *colon2 = slash ? strchr(slash, ':') : NULL;
     size_t ip_len, pfx_len;
-    char cmd[2400];
+    char cmd[3200];
     int n, rc;
 
     if (!slash || !colon2) {
@@ -557,7 +789,7 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
         "        - to: default\n"
         "          via: %s\n"
         "      nameservers:\n"
-        "        addresses: [%s, 8.8.8.8]\n"
+        "        addresses: [8.8.8.8, 1.1.1.1]\n"
         "EOF\n"
         /* Apply, then restart the renderer to drop stale leases / state
          * left behind by cloud-init or a previous run. netplan apply
@@ -578,19 +810,25 @@ static void handle_set_ip(int fd, const char *tag, const char *args)
         "umask 022 && "
         "netplan apply 2>&1; "
         "if [ \"$RENDERER\" = NetworkManager ]; then "
-        "  systemctl restart NetworkManager 2>&1; "
+        "  systemctl restart NetworkManager 2>&1 && "
+        /* NetworkManager may adopt the already-configured NIC as an external
+         * connection during its restart. Explicitly activate netplan's
+         * profile so its DNS settings, not stale resolver state, win. */
+        "  nmcli connection up netplan-appsbnic "
+        "    ifname \"$(ls /sys/class/net | grep '^e' | head -n 1)\" 2>&1; "
         "else "
         "  systemctl restart systemd-networkd 2>&1; "
         "fi; "
-        /* Verify the address actually materialised. netplan apply / NM
-         * reload are async — the host might try to SSH before the new
-         * IP claims the wire. Poll for up to 5 seconds. */
+        /* Verify the address and resolver actually materialised. netplan
+         * apply / NM reload are async — the host might try to SSH before the
+         * new state claims the wire. Poll for up to 5 seconds. */
         "for i in 1 2 3 4 5 6 7 8 9 10; do "
-        "  ip -4 addr show | grep -q '%s/' && exit 0; "
+        "  ip -4 addr show | grep -q '%s/' && "
+        "    grep -q '^nameserver 8.8.8.8$' /etc/resolv.conf && exit 0; "
         "  sleep 0.5; "
         "done; "
         "echo 'set_ip: address never appeared'; ip -4 addr show; exit 1",
-        ip, prefix, gw, gw, ip);
+        ip, prefix, gw, ip);
     if (n < 0 || n >= (int)sizeof(cmd)) {
         send_reply(fd, tag, "error:cmd_too_long");
         return;
@@ -1111,6 +1349,9 @@ static void handle_client(int fd)
         }
         else if (strncmp(cmd, "set_ip:", 7) == 0) {
             handle_set_ip(fd, tag, cmd + 7);
+        }
+        else if (strncmp(cmd, "display_resize:", 15) == 0) {
+            handle_display_resize(fd, tag, cmd + 15);
         }
         else if (strcmp(cmd, "ssh_enable") == 0) {
             handle_ssh_enable(fd, tag);

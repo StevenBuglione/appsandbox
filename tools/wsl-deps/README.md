@@ -54,26 +54,25 @@ themselves — the host-installed copy is the single source of truth.
 ## What we do with them
 
 At VM-create time (one-time per host install) we run the prefetch
-script. It downloads the two `.nupkg` blobs from the flat2 endpoint,
-unzips, and lays them out under `C:\ProgramData\AppSandbox\wsl-deps\`:
+helper. It downloads the two `.nupkg` blobs from the flat2 endpoint,
+then merges those generic runtime files with the driver-matched Linux
+helpers already installed under `%SystemRoot%\System32\lxss\lib`. The
+merged host-only directory lives under `C:\ProgramData\AppSandbox\wsl-deps\`:
 
 ```
 C:\ProgramData\AppSandbox\wsl-deps\
-├── current\lib\                                   ← Plan9-shared into the guest
-│   ├── libd3d12.so
-│   ├── libd3d12core.so
-│   └── libdxcore.so                               (renamed from libDXCore.so)
-├── direct3d-linux-1.611.1-81528511\lib\
-│   ├── x64\{libd3d12.so, libd3d12core.so}
-│   └── arm64\{libd3d12.so, libd3d12core.so}
-└── dxcore-linux-amd64fre-10.0.26100.1-240331-1435.ge-release\lib\
-    └── libdxcore.so
+└── current\lib\                                   ← Plan9-shared into the guest
+    ├── libd3d12.so
+    ├── libd3d12core.so
+    ├── libdxcore.so                               (renamed from libDXCore.so)
+    └── libnvdxdlkernels.so, ...                   (host driver-matched helpers)
 ```
 
 `current\lib` is what `gpu_append_lxsslib_share` Plan9-shares into the
-guest as `/usr/lib/wsl/lib/`. The versioned dirs are kept alongside for
-auditability — if we ever bump the version we can roll back without
-re-downloading.
+guest as `/usr/lib/wsl/lib/`. Keeping the vendor helpers in that exact
+directory matters because Microsoft's D3D12 runtime resolves them from
+the WSL-compatible path. Nothing from this cache is embedded in a guest
+image or redistributed with AppSandbox.
 
 ## Hashes for verification
 
