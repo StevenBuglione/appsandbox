@@ -49,4 +49,13 @@ BOOL vm_display_idd_resize(VmDisplayIdd *display, UINT width, UINT height);
    geometry is rendered; ending it commits one guest modeset. */
 BOOL vm_display_idd_set_resize_phase(VmDisplayIdd *display, BOOL active);
 
+/* Send bounded pointer gestures through the input channel already owned by
+   this exact display. Coordinates are guest-frame coordinates; no HWND,
+   arbitrary packet, or global input hook is exposed to API callers. */
+BOOL vm_display_idd_pointer_click(VmDisplayIdd *display, UINT x, UINT y);
+BOOL vm_display_idd_pointer_drag(VmDisplayIdd *display,
+                                 UINT start_x, UINT start_y,
+                                 UINT end_x, UINT end_y,
+                                 UINT steps);
+
 #endif /* VM_DISPLAY_IDD_H */

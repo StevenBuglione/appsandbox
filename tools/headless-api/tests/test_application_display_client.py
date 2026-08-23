@@ -52,6 +52,35 @@ class ApplicationDisplayClientTests(unittest.TestCase):
             ],
         )
 
+    def test_pointer_gestures_are_scoped_to_one_open_display(self):
+        client = asb.Client("http://127.0.0.1:1", "token")
+        with patch.object(client, "_req", return_value=(202, {})) as request:
+            client.click_display("vm", 840, 96)
+            client.drag_display("vm", 620, 480, 760, 480, 32)
+        self.assertEqual(
+            request.call_args_list,
+            [
+                unittest.mock.call(
+                    "PUT", "/vms/vm/display",
+                    {"input": "click", "x": 840, "y": 96},
+                ),
+                unittest.mock.call(
+                    "PUT", "/vms/vm/display",
+                    {"input": "drag", "x": 620, "y": 480,
+                     "endX": 760, "endY": 480, "steps": 32},
+                ),
+            ],
+        )
+
+        header = (
+            Path(__file__).resolve().parents[3]
+            / "src"
+            / "backend_win"
+            / "vm_display_idd.h"
+        ).read_text(encoding="utf-8")
+        self.assertIn("vm_display_idd_pointer_click", header)
+        self.assertIn("vm_display_idd_pointer_drag", header)
+
     def test_native_video_present_never_blocks_the_window_thread(self):
         source = (
             Path(__file__).resolve().parents[3]

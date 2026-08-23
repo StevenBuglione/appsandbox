@@ -159,6 +159,15 @@ class Client:
     def end_display_resize(self, name):
         """End the resize and commit its newest geometry to the guest once."""
         return self._req("PUT", "/vms/%s/display" % name, {"phase": "end"})
+    def click_display(self, name, x, y):
+        """Click one bounded guest-frame point through the open display."""
+        return self._req("PUT", "/vms/%s/display" % name,
+                         {"input": "click", "x": x, "y": y})
+    def drag_display(self, name, x, y, end_x, end_y, steps=24):
+        """Drag between two bounded guest-frame points through the open display."""
+        return self._req("PUT", "/vms/%s/display" % name,
+                         {"input": "drag", "x": x, "y": y,
+                          "endX": end_x, "endY": end_y, "steps": steps})
     def display_status(self, name):
         """{'open': bool, 'ready': bool}. 'ready' is the agent's own report that the
         display driver is up (running + agentOnline + idd_status) -- a passive flag,

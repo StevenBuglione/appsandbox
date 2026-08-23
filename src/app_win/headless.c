@@ -964,6 +964,7 @@ static int handle_request(PHTTP_REQUEST req)
                 DisplayEntry *e = display_find(v->unique_id);
                 wchar_t body[512];
                 wchar_t phase[16] = L"";
+                wchar_t input[16] = L"";
                 int width = 0, height = 0;
                 if (!e || !e->disp) {
                     send_err(req->RequestId, 409, "Conflict", "display_not_open",
@@ -971,6 +972,45 @@ static int handle_request(PHTTP_REQUEST req)
                     return 0;
                 }
                 body_to_wide(req, body, 512);
+                if (json_get_string(body, L"input", input, 16)) {
+                    int x = 0, y = 0, end_x = 0, end_y = 0, steps = 0;
+                    if (!json_get_int(body, L"x", &x) || !json_get_int(body, L"y", &y) ||
+                        x < 0 || y < 0 || x > 7679 || y > 4319) {
+                        send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                                 "display input coordinates are missing or outside the supported range");
+                        return 0;
+                    }
+                    if (_wcsicmp(input, L"click") == 0) {
+                        if (!vm_display_idd_pointer_click(e->disp, (UINT)x, (UINT)y)) {
+                            send_err(req->RequestId, 409, "Conflict", "display_input_failed",
+                                     "the owned display input channel is unavailable or the point is outside its frame");
+                            return 0;
+                        }
+                        send_json(req->RequestId, 202, "Accepted",
+                                  "{\"ok\":true,\"displayOpen\":true,\"input\":\"click\",\"inputApplied\":true}");
+                        return 0;
+                    }
+                    if (_wcsicmp(input, L"drag") != 0 ||
+                        !json_get_int(body, L"endX", &end_x) ||
+                        !json_get_int(body, L"endY", &end_y) ||
+                        !json_get_int(body, L"steps", &steps) ||
+                        end_x < 0 || end_y < 0 || end_x > 7679 || end_y > 4319 ||
+                        steps < 2 || steps > 120) {
+                        send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                                 "display drag requires bounded end coordinates and 2..120 steps");
+                        return 0;
+                    }
+                    if (!vm_display_idd_pointer_drag(e->disp, (UINT)x, (UINT)y,
+                                                     (UINT)end_x, (UINT)end_y,
+                                                     (UINT)steps)) {
+                        send_err(req->RequestId, 409, "Conflict", "display_input_failed",
+                                 "the owned display input channel is unavailable or the drag is outside its frame");
+                        return 0;
+                    }
+                    send_json(req->RequestId, 202, "Accepted",
+                              "{\"ok\":true,\"displayOpen\":true,\"input\":\"drag\",\"inputApplied\":true}");
+                    return 0;
+                }
                 if (json_get_string(body, L"phase", phase, 16)) {
                     BOOL active;
                     if (_wcsicmp(phase, L"begin") == 0) {

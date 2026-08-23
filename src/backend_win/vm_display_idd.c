@@ -871,6 +871,60 @@ done:
     return sent;
 }
 
+static BOOL idd_pointer_coordinates_valid(VmDisplayIdd *d, UINT x, UINT y)
+{
+    UINT width;
+    UINT height;
+
+    if (!d) return FALSE;
+    EnterCriticalSection(&d->frame_cs);
+    width = d->frame_width;
+    height = d->frame_height;
+    LeaveCriticalSection(&d->frame_cs);
+    return width > 0 && height > 0 && x < width && y < height;
+}
+
+BOOL vm_display_idd_pointer_click(VmDisplayIdd *d, UINT x, UINT y)
+{
+    BOOL moved;
+    BOOL pressed;
+    BOOL released;
+
+    if (!idd_pointer_coordinates_valid(d, x, y)) return FALSE;
+    moved = send_input(d, INPUT_MOUSE_MOVE, x, y, 0);
+    pressed = moved && send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 1, 0);
+    released = send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 0, 0);
+    return moved && pressed && released;
+}
+
+BOOL vm_display_idd_pointer_drag(VmDisplayIdd *d,
+                                 UINT start_x, UINT start_y,
+                                 UINT end_x, UINT end_y,
+                                 UINT steps)
+{
+    UINT step;
+    BOOL ok;
+    BOOL released;
+
+    if (steps < 2 || steps > 120 ||
+        !idd_pointer_coordinates_valid(d, start_x, start_y) ||
+        !idd_pointer_coordinates_valid(d, end_x, end_y))
+        return FALSE;
+
+    ok = send_input(d, INPUT_MOUSE_MOVE, start_x, start_y, 0);
+    ok = ok && send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 1, 0);
+    for (step = 1; ok && step <= steps; ++step) {
+        const UINT x = (UINT)(((UINT64)start_x * (steps - step) +
+                               (UINT64)end_x * step) / steps);
+        const UINT y = (UINT)(((UINT64)start_y * (steps - step) +
+                               (UINT64)end_y * step) / steps);
+        ok = send_input(d, INPUT_MOUSE_MOVE, x, y, 0);
+        Sleep(4U);
+    }
+    released = send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 0, 0);
+    return ok && released;
+}
+
 /* ==================================================================
  * Per-VM display settings (display_settings.json beside disk.vhdx)
  *
