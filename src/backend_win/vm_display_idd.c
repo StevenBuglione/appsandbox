@@ -389,6 +389,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
+
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 
@@ -1673,21 +1674,27 @@ static BOOL d3d_update_startup_texture(VmDisplayIdd *d)
             d->ctx->lpVtbl->UpdateSubresource(
                 d->ctx, (ID3D11Resource *)d->startup_tex, 0,
                 NULL, frame.pixels, frame.stride, 0);
-        } else if (frame.dirty.right > frame.dirty.left &&
-                   frame.dirty.bottom > frame.dirty.top) {
-            D3D11_BOX box;
-            const BYTE *source;
-            box.left = (UINT)frame.dirty.left;
-            box.top = (UINT)frame.dirty.top;
-            box.front = 0;
-            box.right = (UINT)frame.dirty.right;
-            box.bottom = (UINT)frame.dirty.bottom;
-            box.back = 1;
-            source = frame.pixels + (SIZE_T)box.top * frame.stride +
-                     (SIZE_T)box.left * 4;
-            d->ctx->lpVtbl->UpdateSubresource(
-                d->ctx, (ID3D11Resource *)d->startup_tex, 0,
-                &box, source, frame.stride, 0);
+        } else {
+            UINT index;
+            for (index = 0; index < frame.dirty_count; ++index) {
+                const RECT *dirty = &frame.dirty[index];
+                D3D11_BOX box;
+                const BYTE *source;
+                if (dirty->right <= dirty->left ||
+                    dirty->bottom <= dirty->top)
+                    continue;
+                box.left = (UINT)dirty->left;
+                box.top = (UINT)dirty->top;
+                box.front = 0;
+                box.right = (UINT)dirty->right;
+                box.bottom = (UINT)dirty->bottom;
+                box.back = 1;
+                source = frame.pixels + (SIZE_T)box.top * frame.stride +
+                         (SIZE_T)box.left * 4;
+                d->ctx->lpVtbl->UpdateSubresource(
+                    d->ctx, (ID3D11Resource *)d->startup_tex, 0,
+                    &box, source, frame.stride, 0);
+            }
         }
     }
     return TRUE;

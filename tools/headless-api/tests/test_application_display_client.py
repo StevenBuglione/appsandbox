@@ -40,7 +40,9 @@ class ApplicationDisplayClientTests(unittest.TestCase):
             "startupPreset": "thinking",
             "startupReadyMode": "manual",
             "startupPosition": "bottom-left",
-            "startupMotion": "glyph",
+            "startupMotion": "orbit",
+            "startupShell": "workspace",
+            "startupSidebar": "expanded",
             "startupBackgroundColor": "#111318",
             "startupForegroundColor": "#f6f4fb",
             "startupAccentColor": "#c9b6ff",
@@ -299,6 +301,29 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("/utf-8", project)
         self.assertIn("/utf-8", preview_project)
         self.assertIn("TreatWarningAsError", preview_project)
+
+    def test_winui_title_bar_is_hosted_in_the_native_window(self):
+        root = Path(__file__).resolve().parents[3]
+        source = (
+            root / "tools" / "winui-titlebar-island-preview" / "main.cpp"
+        ).read_text(encoding="utf-8")
+        project = (
+            root / "tools" / "winui-titlebar-island-preview" /
+            "NativeTitleBarIslandPreview.vcxproj"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("DesktopWindowXamlSource", source)
+        self.assertIn("TitleBar createTitleBar", source)
+        self.assertIn("ContentPreTranslateMessage", source)
+        self.assertIn('L"SidebarToggleButton"', source)
+        self.assertIn('menuBar.Items().Append(file)', source)
+        self.assertIn('menuBar.Items().Append(help)', source)
+        self.assertIn("navigation.Children().Append(menuBar)", source)
+        self.assertIn("titleBar.LeftHeader(navigation)", source)
+        self.assertNotIn("titleBar.Content(menuBar)", source)
+        self.assertGreaterEqual(source.count("color(16, 18, 23)"), 5)
+        self.assertIn("WindowsAppSDKSelfContained>false", project)
+        self.assertIn("Microsoft.WindowsAppSDK.WinUI", project)
 
     def test_display_state_exposes_monotonic_native_presentation_progress(self):
         root = Path(__file__).resolve().parents[3]

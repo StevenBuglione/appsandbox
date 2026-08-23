@@ -3,11 +3,13 @@
 #include <strsafe.h>
 
 #define STARTUP_TEXT_CHARS 192
-#define STARTUP_SPINNER_INTERVAL_MS 120
+#define STARTUP_SPINNER_INTERVAL_MS 100
 
 struct VmStartupScene {
     AsbStartupPosition position;
     AsbStartupMotion motion;
+    AsbStartupShell shell;
+    volatile LONG sidebar;
     COLORREF background_color;
     COLORREF foreground_color;
     COLORREF accent_color;
@@ -30,6 +32,7 @@ struct VmStartupScene {
     UINT stride;
     UINT dpi;
     AsbStartupPhase painted_phase;
+    AsbStartupSidebar painted_sidebar;
     BOOL painted_detailed;
     BOOL delay_visible;
     BOOL animations_enabled;
@@ -37,6 +40,7 @@ struct VmStartupScene {
     ULONGLONG started_ms;
     ULONGLONG last_spinner_ms;
     RECT status_rect;
+    RECT mark_rect;
 };
 
 static void copy_text(wchar_t *destination, size_t destination_chars,
@@ -47,7 +51,7 @@ static void copy_text(wchar_t *destination, size_t destination_chars,
     StringCchCopyW(destination, destination_chars, value);
 }
 
-static int scaled(UINT value, UINT dpi)
+static int scaled(int value, UINT dpi)
 {
     return MulDiv((int)value, (int)(dpi ? dpi : 96), 96);
 }
@@ -153,14 +157,200 @@ static void fill_rect(HDC dc, const RECT *rect, COLORREF color)
     }
 }
 
-static void draw_center_mark(VmStartupScene *scene)
+static COLORREF blend_color(COLORREF from, COLORREF to, UINT amount)
 {
-    int size = scaled(58, scene->dpi);
-    int x = ((int)scene->width - size) / 2;
-    int y = ((int)scene->height - size) / 2 - scaled(34, scene->dpi);
+    UINT inverse = 255u - amount;
+    return RGB(
+        (GetRValue(from) * inverse + GetRValue(to) * amount) / 255u,
+        (GetGValue(from) * inverse + GetGValue(to) * amount) / 255u,
+        (GetBValue(from) * inverse + GetBValue(to) * amount) / 255u);
+}
 
-    if (scene->position == ASB_STARTUP_CENTER)
-        y -= scaled(64, scene->dpi);
+static int sidebar_width(const VmStartupScene *scene,
+                         AsbStartupSidebar sidebar)
+{
+    if (!scene || scene->shell != ASB_STARTUP_SHELL_WORKSPACE ||
+        sidebar == ASB_STARTUP_SIDEBAR_HIDDEN)
+        return 0;
+    return scaled(sidebar == ASB_STARTUP_SIDEBAR_COLLAPSED ? 58 : 236,
+                  scene->dpi);
+}
+
+static void draw_rounded_fill(HDC dc, const RECT *rect, int radius,
+                              COLORREF color)
+{
+    HBRUSH brush = CreateSolidBrush(color);
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    HGDIOBJ old_brush = brush ? SelectObject(dc, brush) : NULL;
+    HGDIOBJ old_pen = pen ? SelectObject(dc, pen) : NULL;
+    RoundRect(dc, rect->left, rect->top, rect->right, rect->bottom,
+              radius, radius);
+    if (old_pen) SelectObject(dc, old_pen);
+    if (old_brush) SelectObject(dc, old_brush);
+    if (pen) DeleteObject(pen);
+    if (brush) DeleteObject(brush);
+}
+
+static void draw_shell(VmStartupScene *scene, AsbStartupSidebar sidebar)
+{
+    int sidebar_pixels;
+    RECT rect;
+    COLORREF sidebar_color;
+    COLORREF muted;
+    HFONT menu_font;
+    HGDIOBJ old_font;
+
+    if (!scene || scene->shell != ASB_STARTUP_SHELL_WORKSPACE)
+        return;
+    sidebar_pixels = sidebar_width(scene, sidebar);
+    sidebar_color = blend_color(scene->background_color,
+                                scene->foreground_color, 10);
+    muted = blend_color(scene->background_color,
+                        scene->foreground_color, 118);
+
+    if (sidebar_pixels > 0) {
+        rect.left = 0;
+        rect.top = 0;
+        rect.right = sidebar_pixels;
+        rect.bottom = (LONG)scene->height;
+        fill_rect(scene->dc, &rect, sidebar_color);
+    }
+
+    {
+        HPEN separator = CreatePen(
+            PS_SOLID, 1,
+            blend_color(scene->background_color, scene->foreground_color, 28));
+        HGDIOBJ old_pen = separator ? SelectObject(scene->dc, separator) : NULL;
+        if (separator) {
+            if (sidebar_pixels > 0) {
+                MoveToEx(scene->dc, sidebar_pixels - 1, 0, NULL);
+                LineTo(scene->dc, sidebar_pixels - 1, (int)scene->height);
+            }
+        }
+        if (old_pen) SelectObject(scene->dc, old_pen);
+        if (separator) DeleteObject(separator);
+    }
+
+    menu_font = scene_font(scene->dpi, 9, FW_NORMAL);
+    old_font = menu_font ? SelectObject(scene->dc, menu_font) : NULL;
+    SetBkMode(scene->dc, TRANSPARENT);
+    SetTextColor(scene->dc, muted);
+
+    if (sidebar_pixels > 0) {
+        int inset = scaled(sidebar == ASB_STARTUP_SIDEBAR_COLLAPSED ? 15 : 16,
+                           scene->dpi);
+        int item_width = sidebar_pixels - inset * 2;
+        int y = scaled(16, scene->dpi);
+        COLORREF item_color = blend_color(sidebar_color,
+                                          scene->foreground_color, 15);
+        UINT i;
+        if (sidebar == ASB_STARTUP_SIDEBAR_EXPANDED) {
+            RECT new_item = { inset, y, inset + item_width,
+                              y + scaled(34, scene->dpi) };
+            draw_rounded_fill(scene->dc, &new_item, scaled(8, scene->dpi),
+                              item_color);
+            SetTextColor(scene->dc, scene->foreground_color);
+            new_item.left += scaled(12, scene->dpi);
+            DrawTextW(scene->dc, L"New window", -1, &new_item,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            y += scaled(58, scene->dpi);
+            SetTextColor(scene->dc, muted);
+            {
+                RECT label = { inset, y, sidebar_pixels - inset,
+                               y + scaled(22, scene->dpi) };
+                DrawTextW(scene->dc, L"WORKSPACE", -1, &label,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            }
+            y += scaled(30, scene->dpi);
+            for (i = 0; i < 4; ++i) {
+                int width = item_width - scaled(i == 2 ? 54 : i * 14,
+                                                scene->dpi);
+                RECT line = { inset, y, inset + width,
+                              y + scaled(9, scene->dpi) };
+                draw_rounded_fill(scene->dc, &line, scaled(5, scene->dpi),
+                                  blend_color(sidebar_color,
+                                              scene->foreground_color, 18));
+                y += scaled(27, scene->dpi);
+            }
+        } else {
+            for (i = 0; i < 4; ++i) {
+                RECT icon = { inset, y, inset + scaled(28, scene->dpi),
+                              y + scaled(28, scene->dpi) };
+                draw_rounded_fill(scene->dc, &icon, scaled(8, scene->dpi),
+                                  item_color);
+                y += scaled(43, scene->dpi);
+            }
+        }
+    }
+
+    if (old_font) SelectObject(scene->dc, old_font);
+    if (menu_font) DeleteObject(menu_font);
+}
+
+static void draw_orbit(VmStartupScene *scene, int center_x, int center_y)
+{
+    static const POINT positions[] = {
+        {0, -50}, {25, -43}, {43, -25}, {50, 0}, {43, 25}, {25, 43},
+        {0, 50}, {-25, 43}, {-43, 25}, {-50, 0}, {-43, -25}, {-25, -43}
+    };
+    UINT trail;
+    for (trail = 0; trail < 3; ++trail) {
+        UINT index = (scene->spinner_frame + ARRAYSIZE(positions) - trail) %
+                     ARRAYSIZE(positions);
+        int radius = scaled(trail == 0 ? 4 : 3, scene->dpi);
+        int x = center_x + scaled(positions[index].x, scene->dpi);
+        int y = center_y + scaled(positions[index].y, scene->dpi);
+        COLORREF color = blend_color(
+            scene->background_color, scene->accent_color,
+            trail == 0 ? 255 : (trail == 1 ? 150 : 72));
+        RECT dot = { x - radius, y - radius, x + radius, y + radius };
+        HBRUSH brush = CreateSolidBrush(color);
+        HPEN pen = CreatePen(PS_SOLID, 1, color);
+        HGDIOBJ old_brush = brush ? SelectObject(scene->dc, brush) : NULL;
+        HGDIOBJ old_pen = pen ? SelectObject(scene->dc, pen) : NULL;
+        Ellipse(scene->dc, dot.left, dot.top, dot.right, dot.bottom);
+        if (old_pen) SelectObject(scene->dc, old_pen);
+        if (old_brush) SelectObject(scene->dc, old_brush);
+        if (pen) DeleteObject(pen);
+        if (brush) DeleteObject(brush);
+    }
+}
+
+static void calculate_mark_rect(VmStartupScene *scene,
+                                AsbStartupSidebar sidebar)
+{
+    int left = sidebar_width(scene, sidebar);
+    int center_x = left + ((int)scene->width - left) / 2;
+    int center_y = (int)scene->height / 2 -
+                   scaled(scene->position == ASB_STARTUP_CENTER ? 68 : 22,
+                          scene->dpi);
+    int radius = scaled(62, scene->dpi);
+    scene->mark_rect.left = center_x - radius;
+    scene->mark_rect.top = center_y - radius;
+    scene->mark_rect.right = center_x + radius;
+    scene->mark_rect.bottom = center_y + radius;
+}
+
+static void draw_center_mark(VmStartupScene *scene,
+                             AsbStartupSidebar sidebar,
+                             BOOL clear)
+{
+    int size = scaled(96, scene->dpi);
+    int center_x;
+    int center_y;
+    int x;
+    int y;
+
+    calculate_mark_rect(scene, sidebar);
+    center_x = (scene->mark_rect.left + scene->mark_rect.right) / 2;
+    center_y = (scene->mark_rect.top + scene->mark_rect.bottom) / 2;
+    x = center_x - size / 2;
+    y = center_y - size / 2;
+    if (clear)
+        fill_rect(scene->dc, &scene->mark_rect, scene->background_color);
+    if (scene->motion == ASB_STARTUP_MOTION_ORBIT &&
+        scene->animations_enabled)
+        draw_orbit(scene, center_x, center_y);
 
     if (scene->mark_icon) {
         DrawIconEx(scene->dc, x, y, scene->mark_icon, size, size,
@@ -174,7 +364,7 @@ static void draw_center_mark(VmStartupScene *scene)
         HGDIOBJ old_brush = brush ? SelectObject(scene->dc, brush) : NULL;
         HGDIOBJ old_pen = pen ? SelectObject(scene->dc, pen) : NULL;
         wchar_t initial[2] = { scene->app_name[0] ? scene->app_name[0] : L'L', 0 };
-        HFONT font = scene_font(scene->dpi, 22, FW_SEMIBOLD);
+        HFONT font = scene_font(scene->dpi, 25, FW_SEMIBOLD);
         HGDIOBJ old_font = font ? SelectObject(scene->dc, font) : NULL;
         RECT text_rect = { x, y, x + size, y + size };
 
@@ -193,19 +383,26 @@ static void draw_center_mark(VmStartupScene *scene)
     }
 }
 
-static void calculate_status_rect(VmStartupScene *scene)
+static void calculate_status_rect(VmStartupScene *scene,
+                                  AsbStartupSidebar sidebar)
 {
     int margin = scaled(32, scene->dpi);
     int height = scaled(76, scene->dpi);
+    int main_left = sidebar_width(scene, sidebar);
+    int main_width = (int)scene->width - main_left;
+    int width = scaled(560, scene->dpi);
+    if (width > main_width - margin * 2)
+        width = main_width - margin * 2;
+    if (width < 0) width = 0;
     if (scene->position == ASB_STARTUP_CENTER) {
-        int width = (int)scene->width - margin * 2;
-        scene->status_rect.left = margin;
-        scene->status_rect.right = margin + width;
-        scene->status_rect.top = (int)scene->height / 2 + scaled(22, scene->dpi);
+        scene->status_rect.left = main_left + (main_width - width) / 2;
+        scene->status_rect.right = scene->status_rect.left + width;
+        scene->status_rect.top = (scene->mark_rect.bottom +
+                                  scaled(10, scene->dpi));
         scene->status_rect.bottom = scene->status_rect.top + height;
     } else {
-        scene->status_rect.left = margin;
-        scene->status_rect.right = (int)scene->width - margin;
+        scene->status_rect.left = main_left + margin;
+        scene->status_rect.right = scene->status_rect.left + width;
         scene->status_rect.bottom = (int)scene->height - margin;
         scene->status_rect.top = scene->status_rect.bottom - height;
     }
@@ -302,6 +499,8 @@ VmStartupScene *vm_startup_scene_create(const AsbStartupOptions *options)
 
     scene->position = options->position;
     scene->motion = options->motion;
+    scene->shell = options->shell;
+    scene->sidebar = options->sidebar;
     scene->background_color = options->background_color;
     scene->foreground_color = options->foreground_color;
     scene->accent_color = options->accent_color;
@@ -326,7 +525,7 @@ VmStartupScene *vm_startup_scene_create(const AsbStartupOptions *options)
 
     SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
     scene->animations_enabled =
-        options->motion == ASB_STARTUP_MOTION_GLYPH && animations;
+        options->motion != ASB_STARTUP_MOTION_NONE && animations;
     scene->dc = CreateCompatibleDC(NULL);
     if (!scene->dc) {
         HeapFree(GetProcessHeap(), 0, scene);
@@ -334,10 +533,11 @@ VmStartupScene *vm_startup_scene_create(const AsbStartupOptions *options)
     }
     if (scene->mark_path[0]) {
         scene->mark_icon = (HICON)LoadImageW(NULL, scene->mark_path,
-                                             IMAGE_ICON, 0, 0,
-                                             LR_LOADFROMFILE | LR_DEFAULTSIZE);
+                                             IMAGE_ICON, 256, 256,
+                                             LR_LOADFROMFILE);
     }
     scene->painted_phase = ASB_STARTUP_DISABLED;
+    scene->painted_sidebar = (AsbStartupSidebar)-1;
     return scene;
 }
 
@@ -347,7 +547,7 @@ void vm_startup_scene_refresh_system_settings(VmStartupScene *scene)
     if (!scene) return;
     SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
     scene->animations_enabled =
-        scene->motion == ASB_STARTUP_MOTION_GLYPH && animations;
+        scene->motion != ASB_STARTUP_MOTION_NONE && animations;
 }
 
 void vm_startup_scene_destroy(VmStartupScene *scene)
@@ -372,9 +572,12 @@ BOOL vm_startup_scene_render(VmStartupScene *scene,
     BOOL delay_visible;
     BOOL spinner_due;
     BOOL full_dirty;
+    AsbStartupSidebar sidebar;
 
     if (!scene || !frame || !width || !height) return FALSE;
     ZeroMemory(frame, sizeof(*frame));
+    sidebar = (AsbStartupSidebar)InterlockedCompareExchange(
+        &scene->sidebar, 0, 0);
     resized = scene->width != width || scene->height != height || scene->dpi != dpi;
     if (!ensure_bitmap(scene, width, height)) return FALSE;
     scene->dpi = dpi ? dpi : 96;
@@ -385,30 +588,39 @@ BOOL vm_startup_scene_render(VmStartupScene *scene,
         (scene->last_spinner_ms == 0 ||
          now_ms - scene->last_spinner_ms >= STARTUP_SPINNER_INTERVAL_MS);
     full_dirty = resized || scene->painted_phase != phase ||
+        scene->painted_sidebar != sidebar ||
         scene->painted_detailed != detailed ||
         scene->delay_visible != delay_visible;
 
     if (spinner_due) {
-        scene->spinner_frame = (scene->spinner_frame + 1) % 4;
+        scene->spinner_frame = (scene->spinner_frame + 1) % 12;
         scene->last_spinner_ms = now_ms;
     }
 
-    calculate_status_rect(scene);
+    calculate_mark_rect(scene, sidebar);
+    calculate_status_rect(scene, sidebar);
     if (full_dirty) {
         RECT all = { 0, 0, (LONG)width, (LONG)height };
         fill_rect(scene->dc, &all, scene->background_color);
-        draw_center_mark(scene);
+        draw_shell(scene, sidebar);
+        draw_center_mark(scene, sidebar, FALSE);
         draw_status(scene, phase, detailed, delay_visible);
-        frame->dirty = all;
+        frame->dirty[0] = all;
+        frame->dirty_count = 1;
         frame->full_dirty = TRUE;
         frame->updated = TRUE;
     } else if (spinner_due) {
+        if (scene->motion == ASB_STARTUP_MOTION_ORBIT) {
+            draw_center_mark(scene, sidebar, TRUE);
+            frame->dirty[frame->dirty_count++] = scene->mark_rect;
+        }
         draw_status(scene, phase, detailed, delay_visible);
-        frame->dirty = scene->status_rect;
+        frame->dirty[frame->dirty_count++] = scene->status_rect;
         frame->updated = TRUE;
     }
 
     scene->painted_phase = phase;
+    scene->painted_sidebar = sidebar;
     scene->painted_detailed = detailed;
     scene->delay_visible = delay_visible;
     frame->pixels = scene->pixels;
@@ -421,4 +633,22 @@ BOOL vm_startup_scene_render(VmStartupScene *scene,
 BOOL vm_startup_scene_is_animated(const VmStartupScene *scene)
 {
     return scene && scene->animations_enabled;
+}
+
+BOOL vm_startup_scene_toggle_sidebar(VmStartupScene *scene)
+{
+    LONG current;
+    LONG next;
+    if (!scene || scene->shell != ASB_STARTUP_SHELL_WORKSPACE)
+        return FALSE;
+    do {
+        current = InterlockedCompareExchange(&scene->sidebar, 0, 0);
+        if (current == ASB_STARTUP_SIDEBAR_HIDDEN)
+            return FALSE;
+        next = current == ASB_STARTUP_SIDEBAR_EXPANDED
+            ? ASB_STARTUP_SIDEBAR_COLLAPSED
+            : ASB_STARTUP_SIDEBAR_EXPANDED;
+    } while (InterlockedCompareExchange(&scene->sidebar, next, current) !=
+             current);
+    return TRUE;
 }

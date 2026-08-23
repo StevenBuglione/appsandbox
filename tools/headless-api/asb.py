@@ -148,7 +148,8 @@ class Client:
         appUserModelId, iconPath. A backing size larger than the initial client
         keeps a fixed 1:1 guest canvas while the native window is clipped and
         resized within that capacity. Application mode also accepts
-        showDebugTitle, showDebugOverlay, and showOnOpen. A controller may set
+        showDebugTitle, showDebugOverlay, showOnOpen, bounded title-bar colors,
+        and startup shell/sidebar/motion settings. A controller may set
         showOnOpen=False and reveal the existing display with open_display(name)
         after its logical scene is ready. With no options this preserves the
         normal App Sandbox display window."""
