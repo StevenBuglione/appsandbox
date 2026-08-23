@@ -1577,11 +1577,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
         }
         hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
-                D3D11_MAP_WRITE_DISCARD, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
-            LeaveCriticalSection(&d->frame_cs);
-            return;
-        }
+                D3D11_MAP_WRITE_DISCARD, 0, &mapped);
         if (SUCCEEDED(hr)) {
             UINT row;
             UINT copy_stride = d->frame_width * 4;

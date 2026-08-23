@@ -44,7 +44,6 @@ class ApplicationDisplayClientTests(unittest.TestCase):
             / "backend_win"
             / "vm_display_idd.c"
         ).read_text(encoding="utf-8")
-        self.assertIn("D3D11_MAP_FLAG_DO_NOT_WAIT", source)
         self.assertIn("DXGI_PRESENT_DO_NOT_WAIT", source)
         self.assertIn("frame_message_pending", source)
         self.assertIn(
