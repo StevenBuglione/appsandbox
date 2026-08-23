@@ -148,7 +148,9 @@ class Client:
         appUserModelId, iconPath. A backing size larger than the initial client
         keeps a fixed 1:1 guest canvas while the native window is clipped and
         resized within that capacity. Application mode also accepts
-        showDebugTitle and showDebugOverlay. With no options this preserves the
+        showDebugTitle, showDebugOverlay, and showOnOpen. A controller may set
+        showOnOpen=False and reveal the existing display with open_display(name)
+        after its logical scene is ready. With no options this preserves the
         normal App Sandbox display window."""
         return self._req("POST", "/vms/%s/display" % name, options or None)
     def close_display(self, name): return self._req("DELETE", "/vms/%s/display" % name)

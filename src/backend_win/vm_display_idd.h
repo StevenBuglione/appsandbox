@@ -30,6 +30,7 @@ typedef struct AsbDisplayOptions {
     UINT minimum_height;
     BOOL show_debug_title;
     BOOL show_debug_overlay;
+    BOOL show_on_open;
 } AsbDisplayOptions;
 
 /* Create IDD display window for VM. Connects to VM's AF_HYPERV channels

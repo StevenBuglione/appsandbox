@@ -244,6 +244,7 @@ struct VmDisplayIdd {
     UINT         minimum_height;
     BOOL         show_debug_title;
     BOOL         show_debug_overlay;
+    BOOL         show_on_open;
     HICON        custom_icon;
 
     /* D3D11 */
@@ -2770,10 +2771,13 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             Sleep(25);
     }
 
-    /* Bring the correctly sized display window to the foreground on open. */
-    ShowWindow(d->hwnd, SW_SHOW);
-    BringWindowToTop(d->hwnd);
-    SetForegroundWindow(d->hwnd);
+    /* A controller may defer the first reveal until its logical scene matches
+       the native client. The normal display path retains immediate showing. */
+    if (d->show_on_open) {
+        ShowWindow(d->hwnd, SW_SHOW);
+        BringWindowToTop(d->hwnd);
+        SetForegroundWindow(d->hwnd);
+    }
 
     /* Install the hotkey hook on this (message-pumping) thread if the
        persisted setting has Transmit mode enabled. */
@@ -3307,6 +3311,7 @@ VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
                                 ? options->minimum_height : 180;
     d->show_debug_title   = options ? options->show_debug_title : TRUE;
     d->show_debug_overlay = options ? options->show_debug_overlay : TRUE;
+    d->show_on_open       = options ? options->show_on_open : TRUE;
     d->desired_render_width = (LONG)d->initial_width;
     d->desired_render_height = (LONG)d->initial_height;
     if (options && options->window_title)

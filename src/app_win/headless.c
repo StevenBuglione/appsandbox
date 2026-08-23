@@ -867,6 +867,7 @@ static int handle_request(PHTTP_REQUEST req)
                 display_options.minimum_height = display_options.app_mode ? 500 : 180;
                 display_options.show_debug_title = !display_options.app_mode;
                 display_options.show_debug_overlay = !display_options.app_mode;
+                display_options.show_on_open = TRUE;
 
                 json_get_string(body, L"title", title, 256);
                 json_get_string(body, L"appUserModelId", app_id, 256);
@@ -887,6 +888,8 @@ static int handle_request(PHTTP_REQUEST req)
                     display_options.show_debug_title = bv;
                 if (json_get_bool(body, L"showDebugOverlay", &bv))
                     display_options.show_debug_overlay = bv;
+                if (json_get_bool(body, L"showOnOpen", &bv))
+                    display_options.show_on_open = bv;
                 trim_ws(title);
                 trim_ws(app_id);
                 trim_ws(icon_path);

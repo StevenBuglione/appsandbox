@@ -26,6 +26,7 @@ class ApplicationDisplayClientTests(unittest.TestCase):
             "backingHeight": 1180,
             "showDebugTitle": False,
             "showDebugOverlay": False,
+            "showOnOpen": False,
         }
         with patch.object(client, "_req", return_value=(200, {})) as request:
             client.open_display("vm", **options)
@@ -103,6 +104,7 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("idd_begin_interactive_resize(d, hwnd)", source)
         self.assertIn("idd_end_interactive_resize(d, hwnd)", source)
         self.assertIn("d->app_mode && d->fixed_backing", source)
+        self.assertIn("if (d->show_on_open)", source)
         self.assertIn("vp_w = (float)d->frame_width", source)
         self.assertIn("width = d->fixed_backing ? d->backing_width", source)
         self.assertIn("CreateEventW(NULL, FALSE, FALSE, NULL)", source)
@@ -196,6 +198,7 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('json_get_int(body, L"backingWidth"', headless)
         self.assertIn('json_get_int(body, L"backingHeight"', headless)
+        self.assertIn('json_get_bool(body, L"showOnOpen"', headless)
         self.assertIn(
             "display_options.backing_width < display_options.initial_width",
             headless,
