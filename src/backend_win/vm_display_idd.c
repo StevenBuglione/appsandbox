@@ -260,6 +260,7 @@ struct VmDisplayIdd {
     UINT           frame_stride;
     CRITICAL_SECTION frame_cs;
     volatile BOOL  frame_dirty;
+    volatile LONG  frame_message_pending;
 
     /* Host -> guest display sizing. The window thread only publishes the
        latest physical client size; the worker performs the blocking agent RPC. */
@@ -1576,7 +1577,11 @@ static void d3d_render_frame(VmDisplayIdd *d)
         }
         hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
-                D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+                D3D11_MAP_WRITE_DISCARD, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+            LeaveCriticalSection(&d->frame_cs);
+            return;
+        }
         if (SUCCEEDED(hr)) {
             UINT row;
             UINT copy_stride = d->frame_width * 4;
@@ -1647,7 +1652,15 @@ static void d3d_render_frame(VmDisplayIdd *d)
     /* Draw fullscreen triangle (3 vertices, no vertex buffer) */
     d->ctx->lpVtbl->Draw(d->ctx, 3, 0);
 
-    d->swap_chain->lpVtbl->Present(d->swap_chain, 0, 0);
+    hr = d->swap_chain->lpVtbl->Present(
+            d->swap_chain, 0, DXGI_PRESENT_DO_NOT_WAIT);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+        /* Keep the newest CPU frame eligible for the 16 ms retry timer. The
+           window thread must never wait behind a saturated presentation queue. */
+        d->frame_dirty = TRUE;
+    } else if (FAILED(hr)) {
+        idd_log(d, L"D3D Present failed (0x%08X).", hr);
+    }
 }
 
 static void d3d_cleanup(VmDisplayIdd *d)
@@ -2173,9 +2186,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             LeaveCriticalSection(&d->frame_cs);
             idd_note_applied_frame(d, hdr.width, hdr.height);
 
-            /* Signal the window thread to repaint */
-            if (d->hwnd && IsWindow(d->hwnd))
-                PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0);
+            /* Keep at most one repaint notification queued. A blocked or busy
+               GPU must not create an unbounded UI-message backlog. */
+            if (d->hwnd && IsWindow(d->hwnd) &&
+                InterlockedCompareExchange(&d->frame_message_pending, 1, 0) == 0 &&
+                !PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0))
+                InterlockedExchange(&d->frame_message_pending, 0);
 
             /* Reconnect input socket if send_input flagged it dead */
             if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
@@ -2615,15 +2631,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             GetClientRect(hwnd, &rc);
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
-            d3d_resize_swap_chain(d);
-            d3d_render_frame(d);
             if (wp != SIZE_MINIMIZED) {
                 idd_update_desired_resize(d, hwnd);
-                /* During an interactive drag, the native swap chain follows
-                   every WM_SIZE immediately while the guest keeps rendering
-                   its current mode. A DRM modeset for every few pixels makes
-                   the compositor trail the pointer by seconds; queue one
-                   exact guest resize from WM_EXITSIZEMOVE instead. */
+                /* DWM stretches the last presented buffer during an interactive
+                   drag. ResizeBuffers and the guest modeset are both deferred;
+                   neither is safe or useful for every intermediate pixel. */
                 if (!d->in_size_move)
                     SetTimer(hwnd, IDT_RESIZE_DEBOUNCE,
                              RESIZE_DEBOUNCE_MS, NULL);
@@ -2642,6 +2654,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             d->in_size_move = FALSE;
             KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
+            d3d_resize_swap_chain(d);
+            d3d_render_frame(d);
             idd_update_desired_resize(d, hwnd);
             idd_queue_desired_resize(d);
         }
@@ -2662,12 +2676,17 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 d3d_render_frame(d);
         } else if (wp == IDT_RESIZE_DEBOUNCE && d) {
             KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
+            d3d_resize_swap_chain(d);
+            d3d_render_frame(d);
             idd_queue_desired_resize(d);
         }
         return 0;
 
     case WM_IDD_FRAME_READY:
-        if (d) d3d_render_frame(d);
+        if (d) {
+            InterlockedExchange(&d->frame_message_pending, 0);
+            d3d_render_frame(d);
+        }
         return 0;
 
     case WM_CLIPBOARDUPDATE:
