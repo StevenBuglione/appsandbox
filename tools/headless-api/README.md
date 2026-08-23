@@ -278,7 +278,7 @@ while not c.display_ready("dev"):    # running + agentOnline + agent says displa
 c.open_display("dev")                # a window appears on the daemon's desktop
 c.begin_display_resize("dev")        # optional: one native drag transaction
 c.resize_display("dev", 1320, 800)  # native client applied; guest convergence follows
-c.end_display_resize("dev")          # one final swap-chain resize + guest modeset
+c.end_display_resize("dev")          # fixed backing: native resize only; legacy: final guest modeset
 ...
 c.close_display("dev")              # or the user just closes it with the [X]
 ```
@@ -299,16 +299,18 @@ c.close_display("dev")              # or the user just closes it with the [X]
 - **Resize stays process-owned.** `resize_display` accepts only an already-open
   VM display and bounded client dimensions. The elevated daemon marshals the
   request to that window's owning thread and returns `202` only after its client
-  rectangle exactly matches. The existing `WM_SIZE` path then coalesces and
-  forwards the matching guest display mode. Clients should wait for their
-  ordinary guest convergence receipt after the native acknowledgement.
+  rectangle exactly matches. Legacy mode coalesces and forwards the matching
+  guest display mode. Application mode may instead set `backingWidth` and
+  `backingHeight` larger than the initial client; the guest then keeps that
+  fixed 1:1 canvas while the native window clips it to its current client and
+  the application controller changes logical scene geometry independently.
+  Native client dimensions are bounded by the backing capacity.
 - **Interactive resize remains bounded.** `begin_display_resize` and
   `end_display_resize` expose only the resize phase for that named, open VM
   display—never an HWND or arbitrary native message. Intermediate sizes update
-  the real client rectangle while DWM scales the last complete surface. Ending
-  the phase performs one swap-chain resize and one guest modeset for the newest
-  geometry. This keeps drag handling responsive and avoids exposing unpainted
-  client strips during expansion.
+  the real client rectangle and a worker coalesces swap-chain target changes.
+  Fixed-backing mode preserves 1:1 pixels and performs no drag-time guest
+  modesets; legacy mode may still converge the guest display after the resize.
 - **Local desktop only.** The window shows on the session the daemon runs in. A
   non-interactive session (a service/SSH daemon with no visible desktop) can't
   show one, so `open_display` returns `409 no_display` rather than spawning an

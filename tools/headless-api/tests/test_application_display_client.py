@@ -22,6 +22,8 @@ class ApplicationDisplayClientTests(unittest.TestCase):
             "title": "Linguum Runtime POC",
             "width": 1440,
             "height": 900,
+            "backingWidth": 1900,
+            "backingHeight": 1180,
             "showDebugTitle": False,
             "showDebugOverlay": False,
         }
@@ -100,6 +102,9 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("WM_IDD_RESIZE_PHASE", source)
         self.assertIn("idd_begin_interactive_resize(d, hwnd)", source)
         self.assertIn("idd_end_interactive_resize(d, hwnd)", source)
+        self.assertIn("d->app_mode && d->fixed_backing", source)
+        self.assertIn("vp_w = (float)d->frame_width", source)
+        self.assertIn("width = d->fixed_backing ? d->backing_width", source)
         self.assertIn("CreateEventW(NULL, FALSE, FALSE, NULL)", source)
         self.assertNotIn("IDT_PRESENT", source)
 
@@ -127,7 +132,11 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         ]
         self.assertIn("SWP_NOREDRAW", size_handler)
         self.assertIn("d->render_hwnd != hwnd", size_handler)
-        self.assertIn("idd_request_render(d, FALSE)", size_handler)
+        self.assertIn("idd_request_render(d, TRUE)", size_handler)
+        self.assertIn("idd_queue_desired_resize(d)", size_handler)
+        self.assertNotIn(
+            "guest modesetting remain deferred", size_handler
+        )
 
         creation = source[
             source.index("A product application window renders") :
@@ -174,6 +183,23 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         ]
         self.assertIn("idd_request_render(d, TRUE)", resize_phase_helpers)
         self.assertIn("idd_queue_desired_resize(d)", resize_phase_helpers)
+        self.assertIn(
+            "d->app_mode && d->fixed_backing",
+            source[source.index("static void window_to_vm_coords") :],
+        )
+
+        headless = (
+            Path(__file__).resolve().parents[3]
+            / "src"
+            / "app_win"
+            / "headless.c"
+        ).read_text(encoding="utf-8")
+        self.assertIn('json_get_int(body, L"backingWidth"', headless)
+        self.assertIn('json_get_int(body, L"backingHeight"', headless)
+        self.assertIn(
+            "display_options.backing_width < display_options.initial_width",
+            headless,
+        )
 
         render_worker_start = source.index(
             "static DWORD WINAPI idd_render_thread_proc(LPVOID param)\n{"

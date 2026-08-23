@@ -875,6 +875,10 @@ static int handle_request(PHTTP_REQUEST req)
                     display_options.initial_width = (UINT)iv;
                 if (json_get_int(body, L"height", &iv))
                     display_options.initial_height = (UINT)iv;
+                if (json_get_int(body, L"backingWidth", &iv))
+                    display_options.backing_width = (UINT)iv;
+                if (json_get_int(body, L"backingHeight", &iv))
+                    display_options.backing_height = (UINT)iv;
                 if (json_get_int(body, L"minimumWidth", &iv))
                     display_options.minimum_width = (UINT)iv;
                 if (json_get_int(body, L"minimumHeight", &iv))
@@ -894,7 +898,15 @@ static int handle_request(PHTTP_REQUEST req)
                     display_options.minimum_width < 320 ||
                     display_options.minimum_height < 180 ||
                     display_options.minimum_width > display_options.initial_width ||
-                    display_options.minimum_height > display_options.initial_height) {
+                    display_options.minimum_height > display_options.initial_height ||
+                    ((display_options.backing_width == 0) !=
+                     (display_options.backing_height == 0)) ||
+                    (display_options.backing_width != 0 &&
+                     (!display_options.app_mode ||
+                      display_options.backing_width < display_options.initial_width ||
+                      display_options.backing_height < display_options.initial_height ||
+                      display_options.backing_width > 7680 ||
+                      display_options.backing_height > 4320))) {
                     send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                              "display dimensions are outside the supported range");
                     return 0;

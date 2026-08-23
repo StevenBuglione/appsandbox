@@ -24,6 +24,8 @@ typedef struct AsbDisplayOptions {
     const wchar_t *icon_path;
     UINT initial_width;
     UINT initial_height;
+    UINT backing_width;
+    UINT backing_height;
     UINT minimum_width;
     UINT minimum_height;
     BOOL show_debug_title;
@@ -50,14 +52,14 @@ BOOL vm_display_idd_is_open(VmDisplayIdd *display);
 BOOL vm_display_idd_focus(VmDisplayIdd *display);
 
 /* Resize the exact owned display client from the window-owning thread. Returns
-   only after the native client rectangle matches; WM_SIZE then drives the
-   existing asynchronous guest resize path. */
+   only after the native client rectangle matches. Legacy mode then drives the
+   asynchronous guest resize path; fixed-backing mode keeps its capacity. */
 BOOL vm_display_idd_resize(VmDisplayIdd *display, UINT width, UINT height);
 
 /* Mark the beginning or end of one interactive host resize transaction. This
    is deliberately VM/display scoped: callers never provide an HWND or an
-   arbitrary window message. During the transaction, only the newest client
-   geometry is rendered; ending it commits one guest modeset. */
+   arbitrary window message. A display with a fixed backing size never
+   modesets here; its application controller changes only logical scene size. */
 BOOL vm_display_idd_set_resize_phase(VmDisplayIdd *display, BOOL active);
 
 /* Send bounded pointer gestures through the input channel already owned by

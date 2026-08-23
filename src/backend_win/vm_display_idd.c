@@ -232,11 +232,14 @@ struct VmDisplayIdd {
     /* Application-window identity and sizing. These are owned copies because
        the display outlives the API request that creates it. */
     BOOL         app_mode;
+    BOOL         fixed_backing;
     wchar_t      window_title[256];
     wchar_t      app_user_model_id[256];
     wchar_t      icon_path[MAX_PATH];
     UINT         initial_width;
     UINT         initial_height;
+    UINT         backing_width;
+    UINT         backing_height;
     UINT         minimum_width;
     UINT         minimum_height;
     BOOL         show_debug_title;
@@ -636,8 +639,8 @@ static void idd_update_desired_resize(VmDisplayIdd *d, HWND hwnd)
     BOOL changed = FALSE;
 
     if (!d || !hwnd || !GetClientRect(hwnd, &rc)) return;
-    width = (UINT)rc.right;
-    height = (UINT)rc.bottom;
+    width = d->fixed_backing ? d->backing_width : (UINT)rc.right;
+    height = d->fixed_backing ? d->backing_height : (UINT)rc.bottom;
     if (width < MIN_FRAME_WIDTH || height < MIN_FRAME_HEIGHT ||
         width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
         return;
@@ -1136,6 +1139,7 @@ static void compute_letterbox(UINT client_w, UINT client_h,
 
 /* Map window client coordinates to VM framebuffer coordinates */
 static void window_to_vm_coords(HWND hwnd, int wx, int wy, BOOL stretch,
+                                 BOOL crop,
                                  UINT vm_w, UINT vm_h,
                                  UINT *vx, UINT *vy)
 {
@@ -1144,6 +1148,13 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy, BOOL stretch,
     float local_x, local_y;
 
     GetClientRect(hwnd, &rc);
+    if (crop) {
+        *vx = wx < 0 ? 0 : (UINT)wx;
+        *vy = wy < 0 ? 0 : (UINT)wy;
+        if (*vx >= vm_w) *vx = vm_w - 1;
+        if (*vy >= vm_h) *vy = vm_h - 1;
+        return;
+    }
     if (stretch) {
         vp_x = 0;
         vp_y = 0;
@@ -1812,14 +1823,21 @@ static BOOL d3d_render_frame(VmDisplayIdd *d)
         LeaveCriticalSection(&d->frame_cs);
     }
 
-    /* Application windows always fill their native client area. While Cage is
-       applying the final mode after a resize, stretch the last good frame for
-       a few milliseconds instead of exposing black letterbox bars. At the
-       settled 1:1 size this has no scaling cost. Diagnostic display mode keeps
-       its aspect-preserving viewport. */
+    /* A fixed-capacity application canvas is cropped 1:1. Legacy application
+       mode still fills its client, and diagnostic mode remains letterboxed. */
     {
         float vp_x, vp_y, vp_w, vp_h;
-        if (d->app_mode) {
+        if (d->app_mode && d->fixed_backing) {
+            /* The guest framebuffer is a fixed-capacity canvas. Rendering its
+               native-sized viewport and letting the render target clip the
+               right/bottom remainder preserves 1:1 text and video pixels while
+               the product window changes size. The scene controller resizes
+               Firefox logically inside that canvas. */
+            vp_x = 0;
+            vp_y = 0;
+            vp_w = (float)d->frame_width;
+            vp_h = (float)d->frame_height;
+        } else if (d->app_mode) {
             vp_x = 0;
             vp_y = 0;
             vp_w = (float)d->render_width;
@@ -2951,7 +2969,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
            virtual display supports larger client sizes, including a full
            2560x1440 client on a 2560x1440 host with decorations off-screen. */
         wr.left = 0; wr.top = 0;
-        wr.right = MAX_FRAME_WIDTH; wr.bottom = MAX_FRAME_HEIGHT;
+        wr.right = d && d->fixed_backing
+                       ? (LONG)d->backing_width : MAX_FRAME_WIDTH;
+        wr.bottom = d && d->fixed_backing
+                        ? (LONG)d->backing_height : MAX_FRAME_HEIGHT;
         AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, dpi);
         mmi->ptMaxTrackSize.x = wr.right - wr.left;
         mmi->ptMaxTrackSize.y = wr.bottom - wr.top;
@@ -2978,11 +2999,19 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (wp != SIZE_MINIMIZED) {
                 idd_publish_render_size(d, hwnd);
                 idd_update_desired_resize(d, hwnd);
-                /* Present the newest frame into the existing back buffer. DWM
-                   scales that complete surface across the changing target HWND,
-                   so expansion never exposes an unpainted strip. Buffer
-                   recreation and guest modesetting remain deferred. */
-                idd_request_render(d, FALSE);
+                /* The render worker owns ResizeBuffers, so publish every native
+                   client size to it. Relying on DWM to stretch an old-sized
+                   flip-model buffer left parts of the client stale or black on
+                   some Windows 11 compositor paths. The auto-reset event and
+                   latest-size atomics coalesce a drag burst without blocking
+                   this window thread. */
+                idd_request_render(d, TRUE);
+
+                /* Legacy application mode keeps the guest output following the
+                   native window. Fixed-backing mode publishes the unchanged
+                   capacity here, so this latest-value worker naturally no-ops;
+                   its application controller changes only logical scene size. */
+                idd_queue_desired_resize(d);
                 if (!d->in_size_move)
                     SetTimer(hwnd, IDT_RESIZE_DEBOUNCE,
                              RESIZE_DEBOUNCE_MS, NULL);
@@ -3141,7 +3170,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 /* lp coords are relative to render child */
                 window_to_vm_coords(d->render_hwnd,
                                     (int)(short)LOWORD(lp), (int)(short)HIWORD(lp),
-                                    d->app_mode,
+                                    d->app_mode && !d->fixed_backing,
+                                    d->app_mode && d->fixed_backing,
                                     frame_width, frame_height, &vx, &vy);
                 if (!_wcsicmp(d->os_type, L"Linux") &&
                     !d->input_frame_size_supported) {
@@ -3264,6 +3294,13 @@ VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
                                 ? options->initial_width : DEFAULT_WIDTH;
     d->initial_height     = options && options->initial_height
                                 ? options->initial_height : DEFAULT_HEIGHT;
+    d->backing_width      = options && options->backing_width
+                                ? options->backing_width : d->initial_width;
+    d->backing_height     = options && options->backing_height
+                                ? options->backing_height : d->initial_height;
+    d->fixed_backing      = d->app_mode &&
+                            (d->backing_width != d->initial_width ||
+                             d->backing_height != d->initial_height);
     d->minimum_width      = options && options->minimum_width
                                 ? options->minimum_width : 320;
     d->minimum_height     = options && options->minimum_height
@@ -3492,7 +3529,9 @@ BOOL vm_display_idd_resize(VmDisplayIdd *display, UINT width, UINT height)
     if (!display || !display->open ||
         !display->hwnd || !IsWindow(display->hwnd) ||
         width < display->minimum_width || height < display->minimum_height ||
-        width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
+        width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT ||
+        (display->fixed_backing &&
+         (width > display->backing_width || height > display->backing_height)))
         return FALSE;
     return SendMessageTimeoutW(display->hwnd, WM_IDD_RESIZE,
                                (WPARAM)width, (LPARAM)height,
