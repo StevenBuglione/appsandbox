@@ -169,10 +169,10 @@ class Client:
                          {"input": "drag", "x": x, "y": y,
                           "endX": end_x, "endY": end_y, "steps": steps})
     def display_status(self, name):
-        """{'open': bool, 'ready': bool}. 'ready' is the agent's own report that the
-        display driver is up (running + agentOnline + idd_status) -- a passive flag,
-        NOT a probe: polling it touches no window and no frame channel, so it can't
-        disturb the display. Wait for ready, then call open_display()."""
+        """Pollable passive display state. An open display also reports monotonic
+        receivedFrames, presentedFrames, and presentCount. renderWidth/renderHeight
+        are the last successful native presentation; frame geometry is the latest
+        guest frame. Reading it touches no window and no frame channel."""
         return self._req("GET", "/vms/%s/display" % name)[1]
     def display_ready(self, name):  return bool(self.display_status(name).get("ready"))
     def snapshots(self, name):   return self._req("GET", "/vms/%s/snapshots" % name)[1].get("snapshots", [])

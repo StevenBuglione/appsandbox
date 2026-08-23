@@ -27,6 +27,7 @@
 #pragma warning(disable: 4201) /* nameless struct/union in SDK headers */
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #pragma warning(pop)
 
@@ -154,6 +155,8 @@ typedef struct InputPacket {
 #define PRESENT_RETRY_MS     16
 #define INITIAL_RESIZE_WAIT_MS 10000
 #define RENDER_START_TIMEOUT_MS 15000
+#define POINTER_SETTLE_MS    24
+#define POINTER_PRESS_MS     48
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -275,6 +278,13 @@ struct VmDisplayIdd {
     CRITICAL_SECTION frame_cs;
     volatile BOOL  frame_dirty;
     volatile LONG  frame_message_pending;
+    volatile LONG64 received_frame_generation;
+    volatile LONG64 presented_frame_generation;
+    volatile LONG64 present_count;
+    volatile LONG64 last_guest_frame_sequence;
+    volatile LONG   presented_render_width;
+    volatile LONG   presented_render_height;
+    UINT64          uploaded_frame_generation;
 
     /* Host -> guest display sizing. The window thread only publishes the
        latest physical client size; the worker performs the blocking agent RPC. */
@@ -323,7 +333,7 @@ struct VmDisplayIdd {
     /* Debug log window (separate top-level window) */
     HWND           log_hwnd;        /* top-level log window */
     HWND           log_list_hwnd;   /* listbox inside log window */
-    HWND           render_hwnd;     /* child window for D3D11 rendering */
+    HWND           render_hwnd;     /* D3D target: top-level app HWND or diagnostic child */
 
     /* Clipboard (extracted to vm_clipboard.c) */
     VmClipboard      clipboard;
@@ -493,13 +503,18 @@ static void ensure_idd_class(HINSTANCE hInst)
     if (g_idd_class_registered) return;
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
-    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    /* D3D/DWM own the client pixels. HREDRAW/VREDRAW plus a class brush asks
+       USER32 to invalidate and erase the entire client while an edge is being
+       dragged, which can expose one black compositor frame before the swap
+       chain is presented. WM_SIZE and WM_PAINT already schedule the exact
+       render work we need. */
+    wc.style         = 0;
     wc.lpfnWndProc   = idd_wnd_proc;
     wc.hInstance     = hInst;
     wc.hIcon         = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APPSANDBOX));
     wc.hIconSm       = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APPSANDBOX));
     wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.hbrBackground = NULL;
     wc.lpszClassName = IDD_DISPLAY_CLASS;
     RegisterClassExW(&wc);
 
@@ -507,11 +522,11 @@ static void ensure_idd_class(HINSTANCE hInst)
        hCursor=NULL so WM_SETCURSOR can set the guest cursor. */
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
-    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.style         = 0;
     wc.lpfnWndProc   = idd_render_proc;
     wc.hInstance     = hInst;
     wc.hCursor       = NULL;
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.hbrBackground = NULL;
     wc.lpszClassName = IDD_RENDER_CLASS;
     RegisterClassExW(&wc);
 
@@ -892,7 +907,9 @@ BOOL vm_display_idd_pointer_click(VmDisplayIdd *d, UINT x, UINT y)
 
     if (!idd_pointer_coordinates_valid(d, x, y)) return FALSE;
     moved = send_input(d, INPUT_MOUSE_MOVE, x, y, 0);
+    if (moved) Sleep(POINTER_SETTLE_MS);
     pressed = moved && send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 1, 0);
+    if (pressed) Sleep(POINTER_PRESS_MS);
     released = send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 0, 0);
     return moved && pressed && released;
 }
@@ -912,6 +929,7 @@ BOOL vm_display_idd_pointer_drag(VmDisplayIdd *d,
         return FALSE;
 
     ok = send_input(d, INPUT_MOUSE_MOVE, start_x, start_y, 0);
+    if (ok) Sleep(POINTER_SETTLE_MS);
     ok = ok && send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 1, 0);
     for (step = 1; ok && step <= steps; ++step) {
         const UINT x = (UINT)(((UINT64)start_x * (steps - step) +
@@ -921,6 +939,7 @@ BOOL vm_display_idd_pointer_drag(VmDisplayIdd *d,
         ok = send_input(d, INPUT_MOUSE_MOVE, x, y, 0);
         Sleep(4U);
     }
+    if (ok) Sleep(PRESENT_RETRY_MS);
     released = send_input(d, INPUT_MOUSE_BUTTON, INPUT_BTN_LEFT, 0, 0);
     return ok && released;
 }
@@ -1546,8 +1565,12 @@ static BOOL d3d_ensure_frame_texture(VmDisplayIdd *d, UINT width, UINT height)
 
 static BOOL d3d_init(VmDisplayIdd *d)
 {
-    DXGI_SWAP_CHAIN_DESC scd;
+    DXGI_SWAP_CHAIN_DESC1 scd;
     D3D_FEATURE_LEVEL feature_level;
+    IDXGIDevice *dxgi_device = NULL;
+    IDXGIAdapter *adapter = NULL;
+    IDXGIFactory2 *factory = NULL;
+    IDXGISwapChain1 *swap_chain = NULL;
     D3D11_SAMPLER_DESC sd;
     ID3DBlob *vs_blob = NULL;
     ID3DBlob *ps_blob = NULL;
@@ -1564,27 +1587,53 @@ static BOOL d3d_init(VmDisplayIdd *d)
     if (initial_height < MIN_FRAME_HEIGHT || initial_height > MAX_FRAME_HEIGHT)
         initial_height = d->initial_height;
 
-    /* Create device and swap chain */
+    /* Create a two-buffer flip-model chain. App-mode targets the top-level
+       client directly (rather than an asynchronously resized child HWND), so
+       DWM always has one complete surface to stretch during live edge drag. */
     ZeroMemory(&scd, sizeof(scd));
-    scd.BufferCount                        = 1;
-    scd.BufferDesc.Width                   = initial_width;
-    scd.BufferDesc.Height                  = initial_height;
-    scd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM;
-    scd.BufferDesc.RefreshRate.Numerator   = 60;
-    scd.BufferDesc.RefreshRate.Denominator = 1;
-    scd.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scd.OutputWindow                       = d->render_hwnd;
-    scd.SampleDesc.Count                   = 1;
-    scd.Windowed                           = TRUE;
-    scd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
+    scd.Width            = initial_width;
+    scd.Height           = initial_height;
+    scd.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+    scd.SampleDesc.Count = 1;
+    scd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.BufferCount      = 2;
+    scd.Scaling          = DXGI_SCALING_STRETCH;
+    scd.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    scd.AlphaMode        = DXGI_ALPHA_MODE_IGNORE;
 
-    hr = D3D11CreateDeviceAndSwapChain(
-        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+    hr = D3D11CreateDevice(
+        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         NULL, 0, D3D11_SDK_VERSION,
-        &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
+        &d->device, &feature_level, &d->ctx);
 
     if (FAILED(hr)) {
-        ui_log(L"IDD: D3D11CreateDeviceAndSwapChain failed (0x%08X)", hr);
+        ui_log(L"IDD: D3D11CreateDevice failed (0x%08X)", hr);
+        return FALSE;
+    }
+    hr = d->device->lpVtbl->QueryInterface(
+            d->device, &IID_IDXGIDevice, (void **)&dxgi_device);
+    if (SUCCEEDED(hr))
+        hr = dxgi_device->lpVtbl->GetAdapter(dxgi_device, &adapter);
+    if (SUCCEEDED(hr))
+        hr = adapter->lpVtbl->GetParent(
+                adapter, &IID_IDXGIFactory2, (void **)&factory);
+    if (SUCCEEDED(hr))
+        hr = factory->lpVtbl->CreateSwapChainForHwnd(
+                factory, (IUnknown *)d->device, d->render_hwnd,
+                &scd, NULL, NULL, &swap_chain);
+    if (SUCCEEDED(hr))
+        hr = swap_chain->lpVtbl->QueryInterface(
+                swap_chain, &IID_IDXGISwapChain, (void **)&d->swap_chain);
+    if (factory)
+        factory->lpVtbl->MakeWindowAssociation(
+                factory, d->hwnd, DXGI_MWA_NO_ALT_ENTER);
+    if (swap_chain) swap_chain->lpVtbl->Release(swap_chain);
+    if (factory) factory->lpVtbl->Release(factory);
+    if (adapter) adapter->lpVtbl->Release(adapter);
+    if (dxgi_device) dxgi_device->lpVtbl->Release(dxgi_device);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: flip-model swap-chain creation failed (0x%08X)", hr);
         return FALSE;
     }
     d->render_width = initial_width;
@@ -1756,6 +1805,8 @@ static BOOL d3d_render_frame(VmDisplayIdd *d)
             d->ctx->lpVtbl->Unmap(d->ctx,
                     (ID3D11Resource *)d->frame_tex, 0);
             d->frame_dirty = FALSE;
+            d->uploaded_frame_generation = (UINT64)InterlockedCompareExchange64(
+                    &d->received_frame_generation, 0, 0);
             frame_uploaded = TRUE;
         }
         LeaveCriticalSection(&d->frame_cs);
@@ -1815,6 +1866,16 @@ static BOOL d3d_render_frame(VmDisplayIdd *d)
         return TRUE;
     } else if (FAILED(hr)) {
         idd_log(d, L"D3D Present failed (0x%08X).", hr);
+    } else {
+        InterlockedIncrement64(&d->present_count);
+        InterlockedExchange(&d->presented_render_width, (LONG)d->render_width);
+        InterlockedExchange(&d->presented_render_height, (LONG)d->render_height);
+        if (d->uploaded_frame_generation != 0) {
+            InterlockedExchange64(
+                    &d->presented_frame_generation,
+                    (LONG64)d->uploaded_frame_generation);
+            d->uploaded_frame_generation = 0;
+        }
     }
     return d->frame_dirty;
 }
@@ -2392,6 +2453,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             d->frame_dirty = TRUE;
             d->recv_count++;
+            InterlockedExchange64(&d->last_guest_frame_sequence, (LONG64)hdr.frame_seq);
+            InterlockedIncrement64(&d->received_frame_generation);
             LeaveCriticalSection(&d->frame_cs);
             idd_note_applied_frame(d, hdr.width, hdr.height);
 
@@ -2576,8 +2639,13 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         }
     }
 
-    /* Render child fills entire client area */
-    {
+    /* A product application window renders into its top-level client. This
+       removes the parent/child resize race that can briefly uncover the
+       parent's background during native edge drag. Diagnostic mode retains
+       the child HWND because its historical input/debug layout depends on it. */
+    if (d->app_mode) {
+        d->render_hwnd = d->hwnd;
+    } else {
         RECT rc;
         GetClientRect(d->hwnd, &rc);
 
@@ -2588,7 +2656,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             d->hwnd, NULL, d->hInstance, NULL);
     }
     if (!d->render_hwnd) {
-        ui_log(L"IDD: Failed to create render child (0x%08X).", GetLastError());
+        ui_log(L"IDD: Failed to establish render target (0x%08X).", GetLastError());
         DestroyWindow(d->hwnd);
         d->hwnd = NULL;
         d->open = FALSE;
@@ -2855,7 +2923,13 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
-        if (d) d->hwnd = NULL;
+        if (d) {
+            /* Application mode aliases render_hwnd to the top-level HWND. Do
+               not leave a destroyed HWND behind for late cursor/focus guards. */
+            if (d->render_hwnd == hwnd)
+                d->render_hwnd = NULL;
+            d->hwnd = NULL;
+        }
         PostQuitMessage(0);
         return 0;
 
@@ -2898,14 +2972,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             RECT rc;
             GetClientRect(hwnd, &rc);
-            if (d->render_hwnd)
+            if (d->render_hwnd && d->render_hwnd != hwnd)
                 SetWindowPos(d->render_hwnd, NULL, 0, 0, rc.right, rc.bottom,
                              SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
             if (wp != SIZE_MINIMIZED) {
                 idd_publish_render_size(d, hwnd);
                 idd_update_desired_resize(d, hwnd);
                 /* Present the newest frame into the existing back buffer. DWM
-                   scales that complete surface across the changing child HWND,
+                   scales that complete surface across the changing target HWND,
                    so expansion never exposes an unpainted strip. Buffer
                    recreation and guest modesetting remain deferred. */
                 idd_request_render(d, FALSE);
@@ -2961,7 +3035,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
 
-    /* Posted by vm_display_idd_focus() from another thread to raise an
+    /* Sent with a bounded timeout by vm_display_idd_focus() from another thread to raise an
        already-open window. Runs on the window's own thread. Restores from
        minimized (the creation path never had to handle that) then brings
        the window forward; SetForegroundWindow succeeds because the user
@@ -2969,9 +3043,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_IDD_FOCUS:
         if (IsIconic(hwnd))
             ShowWindow(hwnd, SW_RESTORE);
+        else
+            ShowWindow(hwnd, SW_SHOW);
         BringWindowToTop(hwnd);
         SetForegroundWindow(hwnd);
-        return 0;
+        SetActiveWindow(hwnd);
+        if (d && d->render_hwnd)
+            SetFocus(d->render_hwnd);
+        return 1;
 
     /* Posted by the authenticated headless API. Keep all HWND mutation on the
        owning window thread so an unelevated client never needs window access. */
@@ -3392,14 +3471,19 @@ BOOL vm_display_idd_is_open(VmDisplayIdd *display)
     return display->open;
 }
 
-void vm_display_idd_focus(VmDisplayIdd *display)
+BOOL vm_display_idd_focus(VmDisplayIdd *display)
 {
+    DWORD_PTR applied = 0;
     if (!display || !display->open ||
         !display->hwnd || !IsWindow(display->hwnd))
-        return;
-    /* Marshal to the window thread; that thread owns the window and runs
-       the activation (restore-if-minimized + foreground) in WM_IDD_FOCUS. */
-    PostMessageW(display->hwnd, WM_IDD_FOCUS, 0, 0);
+        return FALSE;
+    /* Wait only for the owning UI thread to apply activation. This does not
+       involve D3D, guest I/O, or the render worker and closes the race where
+       an authenticated pointer transaction followed an unprocessed focus
+       PostMessage. */
+    return SendMessageTimeoutW(display->hwnd, WM_IDD_FOCUS, 0, 0,
+                               SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+                               1000, &applied) != 0 && applied == 1;
 }
 
 BOOL vm_display_idd_resize(VmDisplayIdd *display, UINT width, UINT height)
@@ -3426,4 +3510,30 @@ BOOL vm_display_idd_set_resize_phase(VmDisplayIdd *display, BOOL active)
                                active ? 1 : 0, 0,
                                SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
                                5000, &applied) != 0 && applied == 1;
+}
+
+BOOL vm_display_idd_get_runtime_state(VmDisplayIdd *display,
+                                      AsbDisplayRuntimeState *state)
+{
+    if (!display || !state || !display->open || display->stop)
+        return FALSE;
+
+    ZeroMemory(state, sizeof(*state));
+    state->received_frames = (UINT64)InterlockedCompareExchange64(
+            &display->received_frame_generation, 0, 0);
+    state->presented_frames = (UINT64)InterlockedCompareExchange64(
+            &display->presented_frame_generation, 0, 0);
+    state->present_count = (UINT64)InterlockedCompareExchange64(
+            &display->present_count, 0, 0);
+    state->guest_frame_sequence = (UINT64)InterlockedCompareExchange64(
+            &display->last_guest_frame_sequence, 0, 0);
+    state->render_width = (UINT)InterlockedCompareExchange(
+            &display->presented_render_width, 0, 0);
+    state->render_height = (UINT)InterlockedCompareExchange(
+            &display->presented_render_height, 0, 0);
+    EnterCriticalSection(&display->frame_cs);
+    state->frame_width = display->frame_width;
+    state->frame_height = display->frame_height;
+    LeaveCriticalSection(&display->frame_cs);
+    return TRUE;
 }

@@ -6,6 +6,17 @@
 
 typedef struct VmDisplayIdd VmDisplayIdd;
 
+typedef struct AsbDisplayRuntimeState {
+    UINT64 received_frames;
+    UINT64 presented_frames;
+    UINT64 present_count;
+    UINT64 guest_frame_sequence;
+    UINT render_width;
+    UINT render_height;
+    UINT frame_width;
+    UINT frame_height;
+} AsbDisplayRuntimeState;
+
 typedef struct AsbDisplayOptions {
     BOOL app_mode;
     const wchar_t *window_title;
@@ -36,7 +47,7 @@ BOOL vm_display_idd_is_open(VmDisplayIdd *display);
 
 /* Bring an already-open display window to the foreground/focus.
    Safe to call from any thread; the work is marshaled to the window thread. */
-void vm_display_idd_focus(VmDisplayIdd *display);
+BOOL vm_display_idd_focus(VmDisplayIdd *display);
 
 /* Resize the exact owned display client from the window-owning thread. Returns
    only after the native client rectangle matches; WM_SIZE then drives the
@@ -57,5 +68,12 @@ BOOL vm_display_idd_pointer_drag(VmDisplayIdd *display,
                                  UINT start_x, UINT start_y,
                                  UINT end_x, UINT end_y,
                                  UINT steps);
+
+/* Snapshot monotonic frame/presentation progress without touching the frame
+   channel or any HWND. render_width/render_height describe the last successful
+   DXGI presentation, so unattended controllers can synchronize input to pixels
+   that the native host has actually presented. */
+BOOL vm_display_idd_get_runtime_state(VmDisplayIdd *display,
+                                      AsbDisplayRuntimeState *state);
 
 #endif /* VM_DISPLAY_IDD_H */

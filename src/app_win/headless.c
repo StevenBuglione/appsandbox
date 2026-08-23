@@ -938,7 +938,11 @@ static int handle_request(PHTTP_REQUEST req)
                 }
                 e = display_find(v->unique_id);   /* present => still open (a closed one was reaped above) */
                 if (e) {
-                    vm_display_idd_focus(e->disp);            /* already open -> bring to front */
+                    if (!vm_display_idd_focus(e->disp)) {
+                        send_err(req->RequestId, 409, "Conflict", "display_focus_failed",
+                                 "the owned display did not process the focus request");
+                        return 0;
+                    }
                 } else {
                     int slot; for (slot = 0; slot < ASB_MAX_VMS && g_displays[slot].vm_id; slot++) {}
                     if (slot == ASB_MAX_VMS) {
@@ -1068,11 +1072,26 @@ static int handle_request(PHTTP_REQUEST req)
                    asb_vm_idd_ready: running + agent-online + the agent's latched
                    idd_status flag, so a client can poll this on an interval (it disturbs
                    nothing) and POST to open once ready. */
-                char b[160];
-                BOOL open = display_is_open(v->unique_id);
+                char b[512];
+                DisplayEntry *e = display_find(v->unique_id);
+                BOOL open = e && e->disp && vm_display_idd_is_open(e->disp);
                 BOOL ready = open || asb_vm_idd_ready(vm);
-                sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s}",
-                          open ? "true" : "false", ready ? "true" : "false");
+                AsbDisplayRuntimeState state;
+                if (open && vm_display_idd_get_runtime_state(e->disp, &state)) {
+                    sprintf_s(b, sizeof(b),
+                              "{\"open\":true,\"ready\":true,"
+                              "\"receivedFrames\":%llu,\"presentedFrames\":%llu,"
+                              "\"presentCount\":%llu,\"guestFrameSequence\":%llu,"
+                              "\"renderWidth\":%u,\"renderHeight\":%u,"
+                              "\"frameWidth\":%u,\"frameHeight\":%u}",
+                              state.received_frames, state.presented_frames,
+                              state.present_count, state.guest_frame_sequence,
+                              state.render_width, state.render_height,
+                              state.frame_width, state.frame_height);
+                } else {
+                    sprintf_s(b, sizeof(b), "{\"open\":false,\"ready\":%s}",
+                              ready ? "true" : "false");
+                }
                 send_json(req->RequestId, 200, "OK", b);
                 return 0;
             }

@@ -89,6 +89,9 @@ class ApplicationDisplayClientTests(unittest.TestCase):
             / "vm_display_idd.c"
         ).read_text(encoding="utf-8")
         self.assertIn("DXGI_PRESENT_DO_NOT_WAIT", source)
+        self.assertIn("DXGI_SWAP_EFFECT_FLIP_DISCARD", source)
+        self.assertIn("DXGI_SCALING_STRETCH", source)
+        self.assertIn("scd.BufferCount      = 2", source)
         self.assertIn("frame_message_pending", source)
         self.assertIn(
             "InterlockedCompareExchange(&d->frame_message_pending, 1, 0)", source
@@ -123,7 +126,42 @@ class ApplicationDisplayClientTests(unittest.TestCase):
             source.index("case WM_SIZE:") : source.index("case WM_ENTERSIZEMOVE:")
         ]
         self.assertIn("SWP_NOREDRAW", size_handler)
+        self.assertIn("d->render_hwnd != hwnd", size_handler)
         self.assertIn("idd_request_render(d, FALSE)", size_handler)
+
+        creation = source[
+            source.index("A product application window renders") :
+            source.index("The application gate has no App Sandbox debug-log window")
+        ]
+        self.assertIn("d->render_hwnd = d->hwnd", creation)
+
+        destroy_handler = source[
+            source.index("case WM_DESTROY:") : source.index("case WM_GETMINMAXINFO:")
+        ]
+        self.assertIn("if (d->render_hwnd == hwnd)", destroy_handler)
+        self.assertIn("d->render_hwnd = NULL", destroy_handler)
+
+        classes = source[
+            source.index("static void ensure_idd_class") :
+            source.index("static void idd_update_window_title")
+        ]
+        self.assertIn("wc.hbrBackground = NULL", classes)
+        self.assertNotIn("CS_HREDRAW | CS_VREDRAW", classes)
+
+        top_level_proc = source[source.index("static LRESULT CALLBACK idd_wnd_proc") :]
+        self.assertIn("case WM_ERASEBKGND:", top_level_proc)
+        self.assertIn("We handle all painting via D3D11", top_level_proc)
+
+        focus_api = source[source.index("BOOL vm_display_idd_focus") :]
+        self.assertIn("SendMessageTimeoutW", focus_api)
+        self.assertNotIn("PostMessageW(display->hwnd, WM_IDD_FOCUS", focus_api)
+
+        pointer_api = source[
+            source.index("BOOL vm_display_idd_pointer_click") :
+            source.index("Per-VM display settings")
+        ]
+        self.assertIn("Sleep(POINTER_SETTLE_MS)", pointer_api)
+        self.assertIn("Sleep(POINTER_PRESS_MS)", pointer_api)
 
         exit_size_start = source.index("case WM_EXITSIZEMOVE:")
         exit_size_handler = source[
@@ -147,6 +185,31 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("d3d_resize_swap_chain(d, desired_width, desired_height)", render_worker)
         self.assertIn("d3d_render_frame(d)", render_worker)
         self.assertIn("d3d_cleanup(d)", render_worker)
+
+    def test_display_state_exposes_monotonic_native_presentation_progress(self):
+        root = Path(__file__).resolve().parents[3]
+        source = (root / "src" / "backend_win" / "vm_display_idd.c").read_text(
+            encoding="utf-8"
+        )
+        header = (root / "src" / "backend_win" / "vm_display_idd.h").read_text(
+            encoding="utf-8"
+        )
+        api = (root / "src" / "app_win" / "headless.c").read_text(encoding="utf-8")
+        self.assertIn("AsbDisplayRuntimeState", header)
+        self.assertIn("vm_display_idd_get_runtime_state", header)
+        self.assertIn("InterlockedIncrement64(&d->received_frame_generation)", source)
+        self.assertIn("InterlockedIncrement64(&d->present_count)", source)
+        self.assertIn("presented_frame_generation", source)
+        self.assertIn("presented_render_width", source)
+        self.assertIn("presented_render_height", source)
+        self.assertNotIn(
+            "state->render_width = (UINT)InterlockedCompareExchange(\n"
+            "            &display->desired_render_width",
+            source,
+        )
+        self.assertIn("receivedFrames", api)
+        self.assertIn("presentedFrames", api)
+        self.assertIn("presentCount", api)
 
 
 if __name__ == "__main__":
