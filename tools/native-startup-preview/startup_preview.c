@@ -8,6 +8,7 @@
 
 typedef struct PreviewState {
     VmStartupScene *scene;
+    HICON window_icon;
     AsbStartupPhase phase;
     BOOL detailed;
     AsbWindowChromeOptions chrome;
@@ -94,6 +95,10 @@ static LRESULT CALLBACK preview_window_proc(HWND hwnd, UINT message,
             DestroyWindow(hwnd);
             return 0;
         }
+        if (wparam == L'S' && vm_startup_scene_toggle_sidebar(state->scene)) {
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         break;
     case WM_DPICHANGED:
     {
@@ -160,7 +165,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
     startup.position = wcsstr(command_line, L"--center")
         ? ASB_STARTUP_CENTER : ASB_STARTUP_BOTTOM_LEFT;
     startup.motion = wcsstr(command_line, L"--no-motion")
-        ? ASB_STARTUP_MOTION_NONE : ASB_STARTUP_MOTION_GLYPH;
+        ? ASB_STARTUP_MOTION_NONE : ASB_STARTUP_MOTION_ORBIT;
+    startup.shell = wcsstr(command_line, L"--canvas")
+        ? ASB_STARTUP_SHELL_CANVAS : ASB_STARTUP_SHELL_WORKSPACE;
+    startup.sidebar = wcsstr(command_line, L"--collapsed")
+        ? ASB_STARTUP_SIDEBAR_COLLAPSED : ASB_STARTUP_SIDEBAR_EXPANDED;
     startup.background_color = RGB(17, 19, 24);
     startup.foreground_color = RGB(246, 244, 251);
     startup.accent_color = RGB(201, 182, 255);
@@ -172,6 +181,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
     startup.delayed_message = L"First launch can take a little longer.";
     startup.failed_message = L"Something got in the way.";
     startup.failure_detail = L"The browser service did not become ready";
+    startup.mark_path =
+        L"tools\\native-startup-preview\\assets\\linguum-orbit-mark.ico";
     state.scene = vm_startup_scene_create(&startup);
     if (!state.scene) return 2;
     state.phase = parse_phase(command_line);
@@ -196,7 +207,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
         return 3;
     }
 
-    AdjustWindowRectExForDpi(&bounds, style, FALSE, extended_style, 96);
+    AdjustWindowRectExForDpi(
+        &bounds, style, FALSE, extended_style, GetDpiForSystem());
     window = CreateWindowExW(
         extended_style, PREVIEW_CLASS, L"Linguum — Native startup preview",
         style, 160, 100, bounds.right - bounds.left, bounds.bottom - bounds.top,
@@ -204,6 +216,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
     if (!window) {
         vm_startup_scene_destroy(state.scene);
         return 4;
+    }
+    state.window_icon = (HICON)LoadImageW(
+        NULL, startup.mark_path, IMAGE_ICON, 256, 256, LR_LOADFROMFILE);
+    if (state.window_icon) {
+        SendMessageW(window, WM_SETICON, ICON_BIG,
+                     (LPARAM)state.window_icon);
+        SendMessageW(window, WM_SETICON, ICON_SMALL,
+                     (LPARAM)state.window_icon);
     }
     vm_window_chrome_apply(window, &state.chrome, TRUE);
     if (vm_startup_scene_is_animated(state.scene))
@@ -216,5 +236,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
         DispatchMessageW(&message);
     }
     vm_startup_scene_destroy(state.scene);
+    if (state.window_icon) DestroyIcon(state.window_icon);
     return (int)message.wParam;
 }

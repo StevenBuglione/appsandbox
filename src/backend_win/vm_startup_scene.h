@@ -18,9 +18,21 @@ typedef enum AsbStartupPosition {
 } AsbStartupPosition;
 
 typedef enum AsbStartupMotion {
-    ASB_STARTUP_MOTION_GLYPH = 0,
-    ASB_STARTUP_MOTION_NONE = 1
+    ASB_STARTUP_MOTION_ORBIT = 0,
+    ASB_STARTUP_MOTION_GLYPH = 1,
+    ASB_STARTUP_MOTION_NONE = 2
 } AsbStartupMotion;
+
+typedef enum AsbStartupShell {
+    ASB_STARTUP_SHELL_WORKSPACE = 0,
+    ASB_STARTUP_SHELL_CANVAS = 1
+} AsbStartupShell;
+
+typedef enum AsbStartupSidebar {
+    ASB_STARTUP_SIDEBAR_EXPANDED = 0,
+    ASB_STARTUP_SIDEBAR_COLLAPSED = 1,
+    ASB_STARTUP_SIDEBAR_HIDDEN = 2
+} AsbStartupSidebar;
 
 typedef struct AsbStartupOptions {
     BOOL enabled;
@@ -28,6 +40,8 @@ typedef struct AsbStartupOptions {
     BOOL detailed;
     AsbStartupPosition position;
     AsbStartupMotion motion;
+    AsbStartupShell shell;
+    AsbStartupSidebar sidebar;
     COLORREF background_color;
     COLORREF foreground_color;
     COLORREF accent_color;
@@ -49,7 +63,8 @@ typedef struct VmStartupSceneFrame {
     UINT width;
     UINT height;
     UINT stride;
-    RECT dirty;
+    RECT dirty[2];
+    UINT dirty_count;
     BOOL full_dirty;
     BOOL updated;
 } VmStartupSceneFrame;
@@ -70,5 +85,6 @@ BOOL vm_startup_scene_render(VmStartupScene *scene,
 
 BOOL vm_startup_scene_is_animated(const VmStartupScene *scene);
 void vm_startup_scene_refresh_system_settings(VmStartupScene *scene);
+BOOL vm_startup_scene_toggle_sidebar(VmStartupScene *scene);
 
 #endif /* VM_STARTUP_SCENE_H */

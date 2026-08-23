@@ -891,8 +891,10 @@ static int handle_request(PHTTP_REQUEST req)
                 wchar_t startup_preset[24] = {0};
                 wchar_t startup_ready_mode[24] = L"first-frame";
                 wchar_t startup_position[24] = L"bottom-left";
-                wchar_t startup_motion[16] = L"glyph";
-                wchar_t startup_background[16] = L"#111318";
+                wchar_t startup_motion[16] = L"orbit";
+                wchar_t startup_shell[16] = L"workspace";
+                wchar_t startup_sidebar[16] = L"expanded";
+                wchar_t startup_background[16] = L"#101217";
                 wchar_t startup_foreground[16] = L"#f6f4fb";
                 wchar_t startup_accent[16] = L"#c9b6ff";
                 wchar_t startup_mark_path[MAX_PATH] = {0};
@@ -939,6 +941,8 @@ static int handle_request(PHTTP_REQUEST req)
                 json_get_string(body, L"startupReadyMode", startup_ready_mode, 24);
                 json_get_string(body, L"startupPosition", startup_position, 24);
                 json_get_string(body, L"startupMotion", startup_motion, 16);
+                json_get_string(body, L"startupShell", startup_shell, 16);
+                json_get_string(body, L"startupSidebar", startup_sidebar, 16);
                 json_get_string(body, L"startupBackgroundColor", startup_background, 16);
                 json_get_string(body, L"startupForegroundColor", startup_foreground, 16);
                 json_get_string(body, L"startupAccentColor", startup_accent, 16);
@@ -1068,13 +1072,38 @@ static int handle_request(PHTTP_REQUEST req)
                              "startupPosition must be 'bottom-left' or 'center'");
                     return 0;
                 }
-                if (_wcsicmp(startup_motion, L"glyph") == 0) {
+                if (_wcsicmp(startup_motion, L"orbit") == 0) {
+                    display_options.startup.motion = ASB_STARTUP_MOTION_ORBIT;
+                } else if (_wcsicmp(startup_motion, L"glyph") == 0) {
                     display_options.startup.motion = ASB_STARTUP_MOTION_GLYPH;
                 } else if (_wcsicmp(startup_motion, L"none") == 0) {
                     display_options.startup.motion = ASB_STARTUP_MOTION_NONE;
                 } else {
                     send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
-                             "startupMotion must be 'glyph' or 'none'");
+                             "startupMotion must be 'orbit', 'glyph', or 'none'");
+                    return 0;
+                }
+                if (_wcsicmp(startup_shell, L"workspace") == 0) {
+                    display_options.startup.shell = ASB_STARTUP_SHELL_WORKSPACE;
+                } else if (_wcsicmp(startup_shell, L"canvas") == 0) {
+                    display_options.startup.shell = ASB_STARTUP_SHELL_CANVAS;
+                } else {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "startupShell must be 'workspace' or 'canvas'");
+                    return 0;
+                }
+                if (_wcsicmp(startup_sidebar, L"expanded") == 0) {
+                    display_options.startup.sidebar =
+                        ASB_STARTUP_SIDEBAR_EXPANDED;
+                } else if (_wcsicmp(startup_sidebar, L"collapsed") == 0) {
+                    display_options.startup.sidebar =
+                        ASB_STARTUP_SIDEBAR_COLLAPSED;
+                } else if (_wcsicmp(startup_sidebar, L"hidden") == 0) {
+                    display_options.startup.sidebar =
+                        ASB_STARTUP_SIDEBAR_HIDDEN;
+                } else {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "startupSidebar is outside the supported set");
                     return 0;
                 }
                 if (!parse_css_color(startup_background,

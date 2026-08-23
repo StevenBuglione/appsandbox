@@ -145,8 +145,9 @@ class Client:
 
         Application mode accepts mode="application", title, width, height,
         minimumWidth, minimumHeight, appUserModelId, iconPath,
-        showDebugTitle, and showDebugOverlay. With no options this preserves the
-        normal App Sandbox display window."""
+        showDebugTitle, showDebugOverlay, bounded title-bar colors, and startup
+        shell/sidebar/motion settings. With no options this preserves the normal
+        App Sandbox display window."""
         return self._req("POST", "/vms/%s/display" % name, options or None)
     def close_display(self, name): return self._req("DELETE", "/vms/%s/display" % name)
     def resize_display(self, name, width, height):

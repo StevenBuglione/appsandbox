@@ -1,0 +1,202 @@
+<Window
+    x:Class="Linguum.WinUIStartupPreview.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Title="Linguum">
+
+    <Grid x:Name="WindowRoot" Background="{StaticResource LinguumBackgroundBrush}">
+        <Grid.Resources>
+            <x:Double x:Key="TitleBarCompactHeight">36</x:Double>
+            <x:Double x:Key="TitleBarLeftPaddingWidth">0</x:Double>
+            <x:Double x:Key="TitleBarLeftHeaderPaddingWidth">0</x:Double>
+            <x:Double x:Key="TitleBarMinDragRegionWidth">48</x:Double>
+            <Thickness x:Key="TitleBarCompactContentMargin">0</Thickness>
+            <HorizontalAlignment x:Key="TitleBarContentHorizontalAlignment">Left</HorizontalAlignment>
+
+            <Style x:Key="CaptionNavigationButtonStyle" TargetType="Button">
+                <Setter Property="Width" Value="32" />
+                <Setter Property="Height" Value="36" />
+                <Setter Property="Padding" Value="0" />
+                <Setter Property="Margin" Value="0" />
+                <Setter Property="BorderThickness" Value="0" />
+                <Setter Property="Background" Value="Transparent" />
+                <Setter Property="Foreground" Value="#FF9A9A9A" />
+                <Setter Property="HorizontalContentAlignment" Value="Center" />
+                <Setter Property="VerticalContentAlignment" Value="Center" />
+                <Setter Property="CornerRadius" Value="0" />
+            </Style>
+            <Style x:Key="CaptionMenuItemStyle" TargetType="MenuBarItem">
+                <Setter Property="Foreground" Value="#FF9A9A9A" />
+            </Style>
+        </Grid.Resources>
+
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <TitleBar
+            x:Name="AppTitleBar"
+            Grid.Row="0"
+            Height="36"
+            Background="{StaticResource LinguumBackgroundBrush}">
+            <TitleBar.LeftHeader>
+                <StackPanel Orientation="Horizontal" Spacing="0">
+                    <Button
+                        x:Name="SidebarToggleButton"
+                        AutomationProperties.Name="Toggle sidebar"
+                        Click="OnSidebarButtonClicked"
+                        Style="{StaticResource CaptionNavigationButtonStyle}">
+                        <FontIcon FontSize="14" Glyph="&#xE8A0;" />
+                    </Button>
+                    <Button
+                        AutomationProperties.Name="Back"
+                        IsEnabled="False"
+                        Style="{StaticResource CaptionNavigationButtonStyle}">
+                        <FontIcon FontSize="14" Glyph="&#xE72B;" />
+                    </Button>
+                    <Button
+                        AutomationProperties.Name="Forward"
+                        IsEnabled="False"
+                        Style="{StaticResource CaptionNavigationButtonStyle}">
+                        <FontIcon FontSize="14" Glyph="&#xE72A;" />
+                    </Button>
+                </StackPanel>
+            </TitleBar.LeftHeader>
+            <TitleBar.Content>
+                <MenuBar
+                    x:Name="AppMenuBar"
+                    Height="36"
+                    Margin="-10,0,0,0"
+                    Padding="0"
+                    VerticalAlignment="Center">
+                    <MenuBarItem Title="File" Style="{StaticResource CaptionMenuItemStyle}">
+                        <MenuFlyoutItem Text="New Window" IsEnabled="False" />
+                        <MenuFlyoutSeparator />
+                        <MenuFlyoutItem Text="Exit" Click="OnExitClicked" />
+                    </MenuBarItem>
+                    <MenuBarItem Title="Edit" Style="{StaticResource CaptionMenuItemStyle}">
+                        <MenuFlyoutItem Text="Undo" IsEnabled="False" />
+                        <MenuFlyoutItem Text="Redo" IsEnabled="False" />
+                    </MenuBarItem>
+                    <MenuBarItem Title="View" Style="{StaticResource CaptionMenuItemStyle}">
+                        <ToggleMenuFlyoutItem
+                            x:Name="SidebarMenuItem"
+                            Text="Sidebar"
+                            IsChecked="True"
+                            Click="OnSidebarMenuClicked" />
+                        <ToggleMenuFlyoutItem
+                            x:Name="DetailsMenuItem"
+                            Text="Loading details"
+                            Click="OnDetailsMenuClicked" />
+                    </MenuBarItem>
+                    <MenuBarItem Title="Help" Style="{StaticResource CaptionMenuItemStyle}">
+                        <MenuFlyoutItem Text="About Linguum" Click="OnAboutClicked" />
+                    </MenuBarItem>
+                </MenuBar>
+            </TitleBar.Content>
+        </TitleBar>
+
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition x:Name="SidebarColumn" Width="236" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <Border
+                x:Name="Sidebar"
+                Grid.Column="0"
+                Background="{StaticResource LinguumSidebarBrush}"
+                BorderBrush="#20252A32"
+                BorderThickness="0,0,1,0">
+                <StackPanel Padding="16" Spacing="16">
+                    <Button
+                        HorizontalAlignment="Stretch"
+                        HorizontalContentAlignment="Left"
+                        Content="New window"
+                        IsEnabled="False" />
+                    <TextBlock
+                        Margin="0,10,0,0"
+                        FontSize="11"
+                        Foreground="#FF9298AA"
+                        Text="WORKSPACE" />
+                    <Border Height="9" CornerRadius="5" Background="#FF292C34" />
+                    <Border Width="190" Height="9" HorizontalAlignment="Left" CornerRadius="5" Background="#FF292C34" />
+                    <Border Width="148" Height="9" HorizontalAlignment="Left" CornerRadius="5" Background="#FF292C34" />
+                    <Border Width="162" Height="9" HorizontalAlignment="Left" CornerRadius="5" Background="#FF292C34" />
+                </StackPanel>
+            </Border>
+
+            <Grid Grid.Column="1">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <Grid HorizontalAlignment="Center" VerticalAlignment="Center" Width="152" Height="152">
+                    <Canvas
+                        x:Name="Orbit"
+                        Width="152"
+                        Height="152"
+                        RenderTransformOrigin="0.5,0.5">
+                        <Canvas.RenderTransform>
+                            <RotateTransform x:Name="OrbitRotation" />
+                        </Canvas.RenderTransform>
+                        <Ellipse Canvas.Left="72" Canvas.Top="5" Width="8" Height="8" Fill="{StaticResource LinguumAccentBrush}" />
+                        <Ellipse Canvas.Left="113" Canvas.Top="22" Width="6" Height="6" Fill="#99C9B6FF" />
+                        <Ellipse Canvas.Left="132" Canvas.Top="58" Width="5" Height="5" Fill="#55C9B6FF" />
+                    </Canvas>
+                    <Image
+                        Width="112"
+                        Height="112"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Source="Assets/linguum-orbit-mark-256.png"
+                        Stretch="Uniform" />
+                </Grid>
+
+                <StackPanel
+                    Grid.Row="1"
+                    Margin="32,0,32,32"
+                    MaxWidth="640"
+                    HorizontalAlignment="Left"
+                    Spacing="7">
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <TextBlock
+                            VerticalAlignment="Center"
+                            FontSize="18"
+                            Foreground="{StaticResource LinguumAccentBrush}"
+                            Text="✦" />
+                        <TextBlock
+                            x:Name="FriendlyStatus"
+                            FontSize="18"
+                            FontWeight="SemiBold"
+                            Text="Linguum is finding its feet…" />
+                    </StackPanel>
+                    <TextBlock
+                        x:Name="FriendlyHint"
+                        Margin="28,0,0,0"
+                        Foreground="#FF979DAF"
+                        Text="This first hello can take a moment." />
+                    <Border
+                        x:Name="TechnicalDetails"
+                        Margin="28,8,0,0"
+                        Padding="12"
+                        Background="{StaticResource LinguumCardBrush}"
+                        CornerRadius="8"
+                        Visibility="Collapsed">
+                        <StackPanel Spacing="5">
+                            <TextBlock FontWeight="SemiBold" Text="Loading details" />
+                            <TextBlock Foreground="#FFADB3C3" Text="Private workspace started" />
+                            <TextBlock Foreground="#FFADB3C3" Text="Display connection ready" />
+                            <TextBlock Foreground="#FFADB3C3" Text="Browser media is getting ready" />
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>

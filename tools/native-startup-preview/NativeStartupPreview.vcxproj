@@ -58,5 +58,10 @@
     <ClInclude Include="..\..\src\backend_win\vm_startup_scene.h" />
     <ClInclude Include="..\..\src\backend_win\vm_window_chrome.h" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="assets\linguum-orbit-mark.ico" />
+    <None Include="assets\linguum-orbit-mark-256.png" />
+    <None Include="assets\linguum-orbit-mark.png" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
