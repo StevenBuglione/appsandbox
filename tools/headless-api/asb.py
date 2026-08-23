@@ -153,6 +153,12 @@ class Client:
         """Resize one already-open display client through its owning daemon."""
         return self._req("PUT", "/vms/%s/display" % name,
                          {"width": width, "height": height})
+    def begin_display_resize(self, name):
+        """Begin one coalesced interactive resize of an open display."""
+        return self._req("PUT", "/vms/%s/display" % name, {"phase": "begin"})
+    def end_display_resize(self, name):
+        """End the resize and commit its newest geometry to the guest once."""
+        return self._req("PUT", "/vms/%s/display" % name, {"phase": "end"})
     def display_status(self, name):
         """{'open': bool, 'ready': bool}. 'ready' is the agent's own report that the
         display driver is up (running + agentOnline + idd_status) -- a passive flag,

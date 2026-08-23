@@ -265,6 +265,8 @@ it (good in the GUI, wrong for a CLI).
 | `display_ready(name)` | `bool` — shorthand for `display_status()["ready"]` |
 | `open_display(name)` | `(status, body)` — open (or focus) the window |
 | `resize_display(name, width, height)` | `(status, body)` — resize one open client through its owning daemon |
+| `begin_display_resize(name)` | `(status, body)` — begin one coalesced interactive resize transaction |
+| `end_display_resize(name)` | `(status, body)` — end the transaction and commit its newest guest size |
 | `close_display(name)` | `(status, body)` — close it |
 
 The pattern is **poll-then-open**:
@@ -274,7 +276,9 @@ c.start("dev")
 while not c.display_ready("dev"):    # running + agentOnline + agent says display driver up
     time.sleep(1)
 c.open_display("dev")                # a window appears on the daemon's desktop
+c.begin_display_resize("dev")        # optional: one native drag transaction
 c.resize_display("dev", 1320, 800)  # native client applied; guest convergence follows
+c.end_display_resize("dev")          # one final swap-chain resize + guest modeset
 ...
 c.close_display("dev")              # or the user just closes it with the [X]
 ```
@@ -298,6 +302,13 @@ c.close_display("dev")              # or the user just closes it with the [X]
   rectangle exactly matches. The existing `WM_SIZE` path then coalesces and
   forwards the matching guest display mode. Clients should wait for their
   ordinary guest convergence receipt after the native acknowledgement.
+- **Interactive resize remains bounded.** `begin_display_resize` and
+  `end_display_resize` expose only the resize phase for that named, open VM
+  display—never an HWND or arbitrary native message. Intermediate sizes update
+  the real client rectangle while DWM scales the last complete surface. Ending
+  the phase performs one swap-chain resize and one guest modeset for the newest
+  geometry. This keeps drag handling responsive and avoids exposing unpainted
+  client strips during expansion.
 - **Local desktop only.** The window shows on the session the daemon runs in. A
   non-interactive session (a service/SSH daemon with no visible desktop) can't
   show one, so `open_display` returns `409 no_display` rather than spawning an

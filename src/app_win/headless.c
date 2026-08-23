@@ -963,6 +963,7 @@ static int handle_request(PHTTP_REQUEST req)
             if (verb == HttpVerbPUT) {
                 DisplayEntry *e = display_find(v->unique_id);
                 wchar_t body[512];
+                wchar_t phase[16] = L"";
                 int width = 0, height = 0;
                 if (!e || !e->disp) {
                     send_err(req->RequestId, 409, "Conflict", "display_not_open",
@@ -970,6 +971,34 @@ static int handle_request(PHTTP_REQUEST req)
                     return 0;
                 }
                 body_to_wide(req, body, 512);
+                if (json_get_string(body, L"phase", phase, 16)) {
+                    BOOL active;
+                    if (_wcsicmp(phase, L"begin") == 0) {
+                        active = TRUE;
+                    } else if (_wcsicmp(phase, L"end") == 0) {
+                        active = FALSE;
+                    } else {
+                        send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                                 "display resize phase must be 'begin' or 'end'");
+                        return 0;
+                    }
+                    if (!vm_display_idd_set_resize_phase(e->disp, active)) {
+                        send_err(req->RequestId, 500, "Internal Server Error",
+                                 "display_resize_phase_failed",
+                                 "the owned native display did not apply the resize phase");
+                        return 0;
+                    }
+                    if (active) {
+                        send_json(req->RequestId, 202, "Accepted",
+                                  "{\"ok\":true,\"displayOpen\":true,"
+                                  "\"resizePhase\":\"begin\",\"resizePhaseApplied\":true}");
+                    } else {
+                        send_json(req->RequestId, 202, "Accepted",
+                                  "{\"ok\":true,\"displayOpen\":true,"
+                                  "\"resizePhase\":\"end\",\"resizePhaseApplied\":true}");
+                    }
+                    return 0;
+                }
                 if (!json_get_int(body, L"width", &width) ||
                     !json_get_int(body, L"height", &height) ||
                     width < 320 || height < 180 ||

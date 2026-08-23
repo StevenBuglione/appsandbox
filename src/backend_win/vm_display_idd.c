@@ -147,13 +147,13 @@ typedef struct InputPacket {
 #define WM_IDD_FRAME_READY      (WM_USER + 100)
 #define WM_IDD_FOCUS            (WM_USER + 101)
 #define WM_IDD_RESIZE           (WM_USER + 102)
+#define WM_IDD_RESIZE_PHASE     (WM_USER + 103)
 
-/* Timer for Present cadence when no frames arrive */
-#define IDT_PRESENT     2001
-#define PRESENT_MS      16   /* ~60 fps */
 #define IDT_RESIZE_DEBOUNCE 2002
 #define RESIZE_DEBOUNCE_MS  33
+#define PRESENT_RETRY_MS     16
 #define INITIAL_RESIZE_WAIT_MS 10000
+#define RENDER_START_TIMEOUT_MS 15000
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -252,6 +252,20 @@ struct VmDisplayIdd {
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
     ID3D11SamplerState      *sampler;
+    UINT                     render_width;
+    UINT                     render_height;
+
+    /* One worker owns every D3D object and call. The native window thread only
+       publishes the newest client geometry and signals this worker, so Windows
+       move/size/paint dispatch can never wait behind Map, ResizeBuffers, or
+       Present. Auto-reset events collapse bursts to the latest visual state. */
+    HANDLE         render_event;
+    HANDLE         render_ready_event;
+    HANDLE         render_thread;
+    volatile LONG  render_init_result;
+    volatile LONG  render_resize_pending;
+    volatile LONG  desired_render_width;
+    volatile LONG  desired_render_height;
 
     /* Frame buffer (CPU-side, updated by recv thread) */
     BYTE          *frame_buf;
@@ -330,6 +344,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static DWORD WINAPI     idd_window_thread_proc(LPVOID param);
 static DWORD WINAPI     idd_recv_thread_proc(LPVOID param);
 static DWORD WINAPI     idd_resize_thread_proc(LPVOID param);
+static DWORD WINAPI     idd_render_thread_proc(LPVOID param);
 
 /* ---- Window class ---- */
 
@@ -432,19 +447,30 @@ static LRESULT CALLBACK idd_log_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-/* Render child window proc — forwards input + paint to parent for handling */
+/* Render child window proc — forwards input and coalesces expose requests. */
 static LRESULT CALLBACK idd_render_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT: {
-        /* Validate this window's update region; repaint once for expose/resize
-           (rendering is otherwise push-driven by received frames). */
+        HWND parent;
+        VmDisplayIdd *d;
+
+        /* Validate synchronously, but never synchronously call back into the
+           parent. MoveWindow(..., TRUE) used to make rapid resizing re-enter
+           D3D rendering here through SendMessage and block the UI thread. */
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
         EndPaint(hwnd, &ps);
-        SendMessageW(GetParent(hwnd), WM_IDD_FRAME_READY, 0, 0);
+        parent = GetParent(hwnd);
+        d = parent
+            ? (VmDisplayIdd *)GetWindowLongPtrW(parent, GWLP_USERDATA)
+            : NULL;
+        if (d && !d->stop &&
+            InterlockedCompareExchange(&d->frame_message_pending, 1, 0) == 0 &&
+            !PostMessageW(parent, WM_IDD_FRAME_READY, 0, 0))
+            InterlockedExchange(&d->frame_message_pending, 0);
         return 0;
     }
     case WM_MOUSEMOVE:
@@ -611,6 +637,51 @@ static void idd_update_desired_resize(VmDisplayIdd *d, HWND hwnd)
 
     if (changed)
         idd_log(d, L"Host target: %ux%u physical client pixels.", width, height);
+}
+
+static void idd_publish_render_size(VmDisplayIdd *d, HWND hwnd)
+{
+    RECT rc;
+    LONG width, height;
+
+    if (!d || !hwnd || !GetClientRect(hwnd, &rc)) return;
+    width = rc.right - rc.left;
+    height = rc.bottom - rc.top;
+    if (width < MIN_FRAME_WIDTH || height < MIN_FRAME_HEIGHT ||
+        width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
+        return;
+
+    InterlockedExchange(&d->desired_render_width, width);
+    InterlockedExchange(&d->desired_render_height, height);
+}
+
+static void idd_queue_desired_resize(VmDisplayIdd *d);
+
+static void idd_request_render(VmDisplayIdd *d, BOOL resize_swap_chain)
+{
+    if (!d || d->stop) return;
+    if (resize_swap_chain)
+        InterlockedExchange(&d->render_resize_pending, 1);
+    if (d->render_event)
+        SetEvent(d->render_event);
+}
+
+static void idd_begin_interactive_resize(VmDisplayIdd *d, HWND hwnd)
+{
+    if (!d || !hwnd) return;
+    d->in_size_move = TRUE;
+    KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
+}
+
+static void idd_end_interactive_resize(VmDisplayIdd *d, HWND hwnd)
+{
+    if (!d || !hwnd) return;
+    d->in_size_move = FALSE;
+    KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
+    idd_publish_render_size(d, hwnd);
+    idd_request_render(d, TRUE);
+    idd_update_desired_resize(d, hwnd);
+    idd_queue_desired_resize(d);
 }
 
 static void idd_queue_desired_resize(VmDisplayIdd *d)
@@ -1426,13 +1497,24 @@ static BOOL d3d_init(VmDisplayIdd *d)
     D3D11_SAMPLER_DESC sd;
     ID3DBlob *vs_blob = NULL;
     ID3DBlob *ps_blob = NULL;
+    UINT initial_width;
+    UINT initial_height;
     HRESULT hr;
+
+    initial_width = (UINT)InterlockedCompareExchange(
+            &d->desired_render_width, 0, 0);
+    initial_height = (UINT)InterlockedCompareExchange(
+            &d->desired_render_height, 0, 0);
+    if (initial_width < MIN_FRAME_WIDTH || initial_width > MAX_FRAME_WIDTH)
+        initial_width = d->initial_width;
+    if (initial_height < MIN_FRAME_HEIGHT || initial_height > MAX_FRAME_HEIGHT)
+        initial_height = d->initial_height;
 
     /* Create device and swap chain */
     ZeroMemory(&scd, sizeof(scd));
     scd.BufferCount                        = 1;
-    scd.BufferDesc.Width                   = DEFAULT_WIDTH;
-    scd.BufferDesc.Height                  = DEFAULT_HEIGHT;
+    scd.BufferDesc.Width                   = initial_width;
+    scd.BufferDesc.Height                  = initial_height;
     scd.BufferDesc.Format                  = DXGI_FORMAT_B8G8R8A8_UNORM;
     scd.BufferDesc.RefreshRate.Numerator   = 60;
     scd.BufferDesc.RefreshRate.Denominator = 1;
@@ -1451,6 +1533,8 @@ static BOOL d3d_init(VmDisplayIdd *d)
         ui_log(L"IDD: D3D11CreateDeviceAndSwapChain failed (0x%08X)", hr);
         return FALSE;
     }
+    d->render_width = initial_width;
+    d->render_height = initial_height;
 
     /* Create render target view from back buffer */
     {
@@ -1519,13 +1603,39 @@ static BOOL d3d_init(VmDisplayIdd *d)
     return TRUE;
 }
 
-static void d3d_resize_swap_chain(VmDisplayIdd *d)
+static BOOL d3d_create_render_target(VmDisplayIdd *d)
 {
-    RECT rc;
     HRESULT hr;
     ID3D11Texture2D *back_buf = NULL;
 
-    if (!d->swap_chain) return;
+    if (!d->swap_chain || !d->device) return FALSE;
+
+    hr = d->swap_chain->lpVtbl->GetBuffer(d->swap_chain, 0,
+                                   &IID_ID3D11Texture2D, (void **)&back_buf);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: GetBuffer after resize failed (0x%08X)", hr);
+        return FALSE;
+    }
+    hr = d->device->lpVtbl->CreateRenderTargetView(d->device,
+            (ID3D11Resource *)back_buf, NULL, &d->rtv);
+    back_buf->lpVtbl->Release(back_buf);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateRenderTargetView after resize failed (0x%08X)", hr);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL d3d_resize_swap_chain(VmDisplayIdd *d, UINT width, UINT height)
+{
+    HRESULT hr;
+
+    if (!d->swap_chain) return FALSE;
+    if (width < MIN_FRAME_WIDTH || height < MIN_FRAME_HEIGHT ||
+        width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
+        return FALSE;
+    if (d->render_width == width && d->render_height == height && d->rtv)
+        return TRUE;
 
     /* Release old render target */
     if (d->rtv) {
@@ -1534,46 +1644,44 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d)
         d->rtv = NULL;
     }
 
-    GetClientRect(d->render_hwnd, &rc);
-    idd_log(d, L"Resize: render_hwnd client=%dx%d, frame=%ux%u",
-            rc.right, rc.bottom, d->frame_width, d->frame_height);
-    if (rc.right == 0 || rc.bottom == 0) return;
+    idd_log(d, L"Resize: render_hwnd client=%ux%u, frame=%ux%u",
+            width, height, d->frame_width, d->frame_height);
 
     hr = d->swap_chain->lpVtbl->ResizeBuffers(d->swap_chain, 0,
-            (UINT)rc.right, (UINT)rc.bottom,
+            width, height,
             DXGI_FORMAT_UNKNOWN, 0);
     if (FAILED(hr)) {
         ui_log(L"IDD: ResizeBuffers failed (0x%08X)", hr);
-        return;
+        /* ResizeBuffers can fail without invalidating the old back buffer.
+           Reacquire a render target so the last complete frame stays usable. */
+        d3d_create_render_target(d);
+        return FALSE;
     }
 
-    hr = d->swap_chain->lpVtbl->GetBuffer(d->swap_chain, 0,
-                                   &IID_ID3D11Texture2D, (void **)&back_buf);
-    if (SUCCEEDED(hr)) {
-        d->device->lpVtbl->CreateRenderTargetView(d->device,
-                (ID3D11Resource *)back_buf, NULL, &d->rtv);
-        back_buf->lpVtbl->Release(back_buf);
-    }
+    if (!d3d_create_render_target(d))
+        return FALSE;
+    d->render_width = width;
+    d->render_height = height;
+    return TRUE;
 }
 
-static void d3d_render_frame(VmDisplayIdd *d)
+static BOOL d3d_render_frame(VmDisplayIdd *d)
 {
     D3D11_MAPPED_SUBRESOURCE mapped;
     D3D11_VIEWPORT vp;
-    RECT rc;
     HRESULT hr;
     float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     BOOL frame_uploaded = FALSE;
 
     if (!d->device || !d->ctx || !d->swap_chain || !d->rtv)
-        return;
+        return FALSE;
 
     /* Upload frame data to GPU texture if dirty */
     if (d->frame_dirty) {
         EnterCriticalSection(&d->frame_cs);
         if (!d3d_ensure_frame_texture(d, d->frame_width, d->frame_height)) {
             LeaveCriticalSection(&d->frame_cs);
-            return;
+            return FALSE;
         }
         hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
@@ -1604,16 +1712,15 @@ static void d3d_render_frame(VmDisplayIdd *d)
        a few milliseconds instead of exposing black letterbox bars. At the
        settled 1:1 size this has no scaling cost. Diagnostic display mode keeps
        its aspect-preserving viewport. */
-    GetClientRect(d->render_hwnd, &rc);
     {
         float vp_x, vp_y, vp_w, vp_h;
         if (d->app_mode) {
             vp_x = 0;
             vp_y = 0;
-            vp_w = (float)rc.right;
-            vp_h = (float)rc.bottom;
+            vp_w = (float)d->render_width;
+            vp_h = (float)d->render_height;
         } else {
-            compute_letterbox((UINT)rc.right, (UINT)rc.bottom,
+            compute_letterbox(d->render_width, d->render_height,
                               d->frame_width, d->frame_height,
                               &vp_x, &vp_y, &vp_w, &vp_h);
         }
@@ -1651,12 +1758,11 @@ static void d3d_render_frame(VmDisplayIdd *d)
     hr = d->swap_chain->lpVtbl->Present(
             d->swap_chain, 0, DXGI_PRESENT_DO_NOT_WAIT);
     if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
-        /* Keep the newest CPU frame eligible for the 16 ms retry timer. The
-           window thread must never wait behind a saturated presentation queue. */
-        d->frame_dirty = TRUE;
+        return TRUE;
     } else if (FAILED(hr)) {
         idd_log(d, L"D3D Present failed (0x%08X).", hr);
     }
+    return d->frame_dirty;
 }
 
 static void d3d_cleanup(VmDisplayIdd *d)
@@ -1672,6 +1778,59 @@ static void d3d_cleanup(VmDisplayIdd *d)
     if (d->swap_chain) { d->swap_chain->lpVtbl->Release(d->swap_chain); d->swap_chain = NULL; }
     if (d->ctx)        { d->ctx->lpVtbl->Release(d->ctx);               d->ctx = NULL; }
     if (d->device)     { d->device->lpVtbl->Release(d->device);         d->device = NULL; }
+    d->render_width = 0;
+    d->render_height = 0;
+}
+
+static DWORD WINAPI idd_render_thread_proc(LPVOID param)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)param;
+    BOOL present_retry = FALSE;
+
+    if (!d3d_init(d)) {
+        InterlockedExchange(&d->render_init_result, -1);
+        SetEvent(d->render_ready_event);
+        d3d_cleanup(d);
+        return 1;
+    }
+
+    InterlockedExchange(&d->render_init_result, 1);
+    SetEvent(d->render_ready_event);
+    present_retry = d3d_render_frame(d);
+
+    while (!d->stop) {
+        DWORD wait_result = WaitForSingleObject(
+                d->render_event,
+                present_retry ? PRESENT_RETRY_MS : INFINITE);
+        UINT desired_width;
+        UINT desired_height;
+        BOOL resize_requested;
+
+        if (d->stop) break;
+        if (wait_result != WAIT_OBJECT_0 && wait_result != WAIT_TIMEOUT)
+            break;
+
+        desired_width = (UINT)InterlockedCompareExchange(
+                &d->desired_render_width, 0, 0);
+        desired_height = (UINT)InterlockedCompareExchange(
+                &d->desired_render_height, 0, 0);
+        resize_requested =
+            InterlockedExchange(&d->render_resize_pending, 0) != 0;
+
+        if (resize_requested &&
+            !d3d_resize_swap_chain(d, desired_width, desired_height)) {
+            /* A transient device/compositor conflict must not lose the newest
+               geometry. Retry on this worker while the native UI keeps moving. */
+            InterlockedExchange(&d->render_resize_pending, 1);
+            present_retry = TRUE;
+            continue;
+        }
+
+        present_retry = d3d_render_frame(d);
+    }
+
+    d3d_cleanup(d);
+    return 0;
 }
 
 /* ==================================================================
@@ -2182,12 +2341,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             LeaveCriticalSection(&d->frame_cs);
             idd_note_applied_frame(d, hdr.width, hdr.height);
 
-            /* Keep at most one repaint notification queued. A blocked or busy
-               GPU must not create an unbounded UI-message backlog. */
-            if (d->hwnd && IsWindow(d->hwnd) &&
-                InterlockedCompareExchange(&d->frame_message_pending, 1, 0) == 0 &&
-                !PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0))
-                InterlockedExchange(&d->frame_message_pending, 0);
+            /* Auto-reset signaling collapses an arbitrary frame burst to one
+               render-worker wake without involving the native UI queue. */
+            idd_request_render(d, FALSE);
 
             /* Reconnect input socket if send_input flagged it dead */
             if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
@@ -2263,6 +2419,43 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 /* ==================================================================
  * Window thread — creates window, initializes D3D11, runs message pump
  * ================================================================== */
+
+static BOOL idd_wait_for_render_start(VmDisplayIdd *d)
+{
+    DWORD started = GetTickCount();
+
+    for (;;) {
+        DWORD elapsed = GetTickCount() - started;
+        DWORD remaining;
+        DWORD wait_result;
+
+        if (elapsed >= RENDER_START_TIMEOUT_MS)
+            return FALSE;
+        remaining = RENDER_START_TIMEOUT_MS - elapsed;
+        wait_result = MsgWaitForMultipleObjects(
+                1, &d->render_ready_event, FALSE, remaining, QS_ALLINPUT);
+        if (wait_result == WAIT_OBJECT_0)
+            return InterlockedCompareExchange(
+                    &d->render_init_result, 0, 0) == 1;
+        if (wait_result != WAIT_OBJECT_0 + 1)
+            return FALSE;
+
+        /* Swap-chain creation may synchronously message its target HWND. Keep
+           this hidden-startup thread dispatching so cross-thread D3D setup can
+           finish without giving D3D ownership back to the window thread. */
+        {
+            MSG msg;
+            while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) {
+                    PostQuitMessage((int)msg.wParam);
+                    return FALSE;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+}
 
 static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 {
@@ -2340,6 +2533,14 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             0, 0, rc.right, rc.bottom,
             d->hwnd, NULL, d->hInstance, NULL);
     }
+    if (!d->render_hwnd) {
+        ui_log(L"IDD: Failed to create render child (0x%08X).", GetLastError());
+        DestroyWindow(d->hwnd);
+        d->hwnd = NULL;
+        d->open = FALSE;
+        return 1;
+    }
+    idd_publish_render_size(d, d->hwnd);
 
     /* The application gate has no App Sandbox debug-log window. */
     if (d->show_debug_overlay) {
@@ -2383,9 +2584,18 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         idd_log(d, L"IDD display started.");
     }
 
-    /* Initialize D3D11 */
-    if (!d3d_init(d)) {
-        ui_log(L"IDD: D3D11 initialization failed.");
+    /* The render worker is the sole D3D owner. Wait only during hidden startup;
+       after the window is shown the message thread never waits on rendering. */
+    d->render_thread = CreateThread(NULL, 0, idd_render_thread_proc, d, 0, NULL);
+    if (!d->render_thread || !idd_wait_for_render_start(d)) {
+        ui_log(L"IDD: D3D11 render worker initialization failed.");
+        d->stop = TRUE;
+        if (d->render_event) SetEvent(d->render_event);
+        if (d->render_thread) {
+            WaitForSingleObject(d->render_thread, RENDER_START_TIMEOUT_MS);
+            CloseHandle(d->render_thread);
+            d->render_thread = NULL;
+        }
         DestroyWindow(d->hwnd);
         d->hwnd = NULL;
         d->open = FALSE;
@@ -2396,7 +2606,11 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     d->recv_thread = CreateThread(NULL, 0, idd_recv_thread_proc, d, 0, NULL);
     if (!d->recv_thread) {
         ui_log(L"IDD: Failed to create recv thread.");
-        d3d_cleanup(d);
+        d->stop = TRUE;
+        if (d->render_event) SetEvent(d->render_event);
+        WaitForSingleObject(d->render_thread, RENDER_START_TIMEOUT_MS);
+        CloseHandle(d->render_thread);
+        d->render_thread = NULL;
         DestroyWindow(d->hwnd);
         d->hwnd = NULL;
         d->open = FALSE;
@@ -2420,9 +2634,6 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     ShowWindow(d->hwnd, SW_SHOW);
     BringWindowToTop(d->hwnd);
     SetForegroundWindow(d->hwnd);
-
-    /* Start a present timer for steady rendering */
-    SetTimer(d->hwnd, IDT_PRESENT, PRESENT_MS, NULL);
 
     /* Install the hotkey hook on this (message-pumping) thread if the
        persisted setting has Transmit mode enabled. */
@@ -2519,6 +2730,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             d->stop = TRUE;
             KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
             if (d->resize_event) SetEvent(d->resize_event);
+            if (d->render_event) SetEvent(d->render_event);
 
             if (d->resize_thread) {
                 WaitForSingleObject(d->resize_thread, INFINITE);
@@ -2550,6 +2762,16 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 d->recv_thread = NULL;
             }
 
+            /* All D3D cleanup occurs on its owner thread before either HWND is
+               destroyed. This wait is a shutdown-only path; normal move, size,
+               paint, input, and close dispatch never execute a D3D call. */
+            if (d->render_thread) {
+                WaitForSingleObject(d->render_thread,
+                                    RENDER_START_TIMEOUT_MS);
+                CloseHandle(d->render_thread);
+                d->render_thread = NULL;
+            }
+
             d->open = FALSE;
 
             /* Close the separate log window */
@@ -2557,9 +2779,6 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 DestroyWindow(d->log_hwnd);
             d->log_hwnd = NULL;
             d->log_list_hwnd = NULL;
-
-            /* Clean up D3D11 */
-            d3d_cleanup(d);
 
             /* Clean up guest cursor */
             if (d->guest_cursor) {
@@ -2580,7 +2799,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_DESTROY:
-        KillTimer(hwnd, IDT_PRESENT);
+        KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) d->hwnd = NULL;
         PostQuitMessage(0);
@@ -2626,12 +2845,16 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             RECT rc;
             GetClientRect(hwnd, &rc);
             if (d->render_hwnd)
-                MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
+                SetWindowPos(d->render_hwnd, NULL, 0, 0, rc.right, rc.bottom,
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
             if (wp != SIZE_MINIMIZED) {
+                idd_publish_render_size(d, hwnd);
                 idd_update_desired_resize(d, hwnd);
-                /* DWM stretches the last presented buffer during an interactive
-                   drag. ResizeBuffers and the guest modeset are both deferred;
-                   neither is safe or useful for every intermediate pixel. */
+                /* Present the newest frame into the existing back buffer. DWM
+                   scales that complete surface across the changing child HWND,
+                   so expansion never exposes an unpainted strip. Buffer
+                   recreation and guest modesetting remain deferred. */
+                idd_request_render(d, FALSE);
                 if (!d->in_size_move)
                     SetTimer(hwnd, IDT_RESIZE_DEBOUNCE,
                              RESIZE_DEBOUNCE_MS, NULL);
@@ -2640,40 +2863,27 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_ENTERSIZEMOVE:
-        if (d) {
-            d->in_size_move = TRUE;
-            KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
-        }
+        idd_begin_interactive_resize(d, hwnd);
         return 0;
 
     case WM_EXITSIZEMOVE:
-        if (d) {
-            d->in_size_move = FALSE;
-            KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
-            d3d_resize_swap_chain(d);
-            d3d_render_frame(d);
-            idd_update_desired_resize(d, hwnd);
-            idd_queue_desired_resize(d);
-        }
+        idd_end_interactive_resize(d, hwnd);
         return 0;
 
     case WM_PAINT:
     {
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
-        if (d) d3d_render_frame(d);
         EndPaint(hwnd, &ps);
+        idd_request_render(d, FALSE);
         return 0;
     }
 
     case WM_TIMER:
-        if (wp == IDT_PRESENT && d) {
-            if (d->frame_dirty)
-                d3d_render_frame(d);
-        } else if (wp == IDT_RESIZE_DEBOUNCE && d) {
+        if (wp == IDT_RESIZE_DEBOUNCE && d) {
             KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
-            d3d_resize_swap_chain(d);
-            d3d_render_frame(d);
+            idd_publish_render_size(d, hwnd);
+            idd_request_render(d, TRUE);
             idd_queue_desired_resize(d);
         }
         return 0;
@@ -2681,7 +2891,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_IDD_FRAME_READY:
         if (d) {
             InterlockedExchange(&d->frame_message_pending, 0);
-            d3d_render_frame(d);
+            idd_request_render(d, FALSE);
         }
         return 0;
 
@@ -2736,6 +2946,16 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                        GetLastError());
                 return 0;
             }
+            return 1;
+        }
+        return 0;
+
+    case WM_IDD_RESIZE_PHASE:
+        if (d && (wp == 0 || wp == 1)) {
+            if (wp == 1)
+                idd_begin_interactive_resize(d, hwnd);
+            else
+                idd_end_interactive_resize(d, hwnd);
             return 1;
         }
         return 0;
@@ -2917,6 +3137,8 @@ VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
                                 ? options->minimum_height : 180;
     d->show_debug_title   = options ? options->show_debug_title : TRUE;
     d->show_debug_overlay = options ? options->show_debug_overlay : TRUE;
+    d->desired_render_width = (LONG)d->initial_width;
+    d->desired_render_height = (LONG)d->initial_height;
     if (options && options->window_title)
         wcsncpy_s(d->window_title, 256, options->window_title, _TRUNCATE);
     if (options && options->app_user_model_id)
@@ -2949,7 +3171,12 @@ VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
     InitializeCriticalSection(&d->agent_command_cs);
 
     d->resize_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!d->resize_event) {
+    d->render_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    d->render_ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!d->resize_event || !d->render_event || !d->render_ready_event) {
+        if (d->render_ready_event) CloseHandle(d->render_ready_event);
+        if (d->render_event) CloseHandle(d->render_event);
+        if (d->resize_event) CloseHandle(d->resize_event);
         DeleteCriticalSection(&d->agent_command_cs);
         DeleteCriticalSection(&d->resize_cs);
         DeleteCriticalSection(&d->input_send_cs);
@@ -2961,6 +3188,8 @@ VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
 
     d->resize_thread = CreateThread(NULL, 0, idd_resize_thread_proc, d, 0, NULL);
     if (!d->resize_thread) {
+        CloseHandle(d->render_ready_event);
+        CloseHandle(d->render_event);
         CloseHandle(d->resize_event);
         DeleteCriticalSection(&d->agent_command_cs);
         DeleteCriticalSection(&d->resize_cs);
@@ -2979,6 +3208,8 @@ VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
         SetEvent(d->resize_event);
         WaitForSingleObject(d->resize_thread, INFINITE);
         CloseHandle(d->resize_thread);
+        CloseHandle(d->render_ready_event);
+        CloseHandle(d->render_event);
         CloseHandle(d->resize_event);
         DeleteCriticalSection(&d->agent_command_cs);
         DeleteCriticalSection(&d->resize_cs);
@@ -3006,6 +3237,7 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     display->stop = TRUE;
     display->open = FALSE;
     if (display->resize_event) SetEvent(display->resize_event);
+    if (display->render_event) SetEvent(display->render_event);
 
     /* Close the window to unblock the message pump */
     if (display->hwnd && IsWindow(display->hwnd))
@@ -3032,6 +3264,14 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     if (display->recv_thread) {
         WaitForSingleObject(display->recv_thread, 3000);
         CloseHandle(display->recv_thread);
+        display->recv_thread = NULL;
+    }
+
+    if (display->render_thread) {
+        WaitForSingleObject(display->render_thread,
+                            RENDER_START_TIMEOUT_MS);
+        CloseHandle(display->render_thread);
+        display->render_thread = NULL;
     }
 
     if (display->resize_thread) {
@@ -3043,6 +3283,14 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     if (display->resize_event) {
         CloseHandle(display->resize_event);
         display->resize_event = NULL;
+    }
+    if (display->render_event) {
+        CloseHandle(display->render_event);
+        display->render_event = NULL;
+    }
+    if (display->render_ready_event) {
+        CloseHandle(display->render_ready_event);
+        display->render_ready_event = NULL;
     }
 
     /* Clipboard is cleaned up by WM_CLOSE handler, but guard */
@@ -3111,5 +3359,17 @@ BOOL vm_display_idd_resize(VmDisplayIdd *display, UINT width, UINT height)
     return SendMessageTimeoutW(display->hwnd, WM_IDD_RESIZE,
                                (WPARAM)width, (LPARAM)height,
                                SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+                               5000, &applied) != 0 && applied == 1;
+}
+
+BOOL vm_display_idd_set_resize_phase(VmDisplayIdd *display, BOOL active)
+{
+    DWORD_PTR applied = 0;
+    if (!display || !display->open ||
+        !display->hwnd || !IsWindow(display->hwnd))
+        return FALSE;
+    return SendMessageTimeoutW(display->hwnd, WM_IDD_RESIZE_PHASE,
+                               active ? 1 : 0, 0,
+                               SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
                                5000, &applied) != 0 && applied == 1;
 }

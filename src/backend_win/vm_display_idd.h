@@ -43,4 +43,10 @@ void vm_display_idd_focus(VmDisplayIdd *display);
    existing asynchronous guest resize path. */
 BOOL vm_display_idd_resize(VmDisplayIdd *display, UINT width, UINT height);
 
+/* Mark the beginning or end of one interactive host resize transaction. This
+   is deliberately VM/display scoped: callers never provide an HWND or an
+   arbitrary window message. During the transaction, only the newest client
+   geometry is rendered; ending it commits one guest modeset. */
+BOOL vm_display_idd_set_resize_phase(VmDisplayIdd *display, BOOL active);
+
 #endif /* VM_DISPLAY_IDD_H */
