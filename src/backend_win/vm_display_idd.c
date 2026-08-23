@@ -2704,13 +2704,24 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
             UINT dpi = GetDpiForWindow(hwnd);
             RECT wr = { 0, 0, (LONG)width, (LONG)height };
+            RECT client;
             if (width < d->minimum_width || height < d->minimum_height ||
                 width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
                 return 0;
-            AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, dpi);
-            SetWindowPos(hwnd, NULL, 0, 0,
-                         wr.right - wr.left, wr.bottom - wr.top,
-                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            if (IsIconic(hwnd) || IsZoomed(hwnd))
+                ShowWindow(hwnd, SW_RESTORE);
+            if (!AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, dpi) ||
+                !SetWindowPos(hwnd, NULL, 0, 0,
+                              wr.right - wr.left, wr.bottom - wr.top,
+                              SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) ||
+                !GetClientRect(hwnd, &client) ||
+                client.right - client.left != (LONG)width ||
+                client.bottom - client.top != (LONG)height) {
+                ui_log(L"IDD: owned display resize failed (Win32 %lu).",
+                       GetLastError());
+                return 0;
+            }
+            return 1;
         }
         return 0;
 
@@ -3076,11 +3087,14 @@ void vm_display_idd_focus(VmDisplayIdd *display)
 
 BOOL vm_display_idd_resize(VmDisplayIdd *display, UINT width, UINT height)
 {
+    DWORD_PTR applied = 0;
     if (!display || !display->open ||
         !display->hwnd || !IsWindow(display->hwnd) ||
         width < display->minimum_width || height < display->minimum_height ||
         width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
         return FALSE;
-    return PostMessageW(display->hwnd, WM_IDD_RESIZE,
-                        (WPARAM)width, (LPARAM)height);
+    return SendMessageTimeoutW(display->hwnd, WM_IDD_RESIZE,
+                               (WPARAM)width, (LPARAM)height,
+                               SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+                               5000, &applied) != 0 && applied == 1;
 }

@@ -274,7 +274,7 @@ c.start("dev")
 while not c.display_ready("dev"):    # running + agentOnline + agent says display driver up
     time.sleep(1)
 c.open_display("dev")                # a window appears on the daemon's desktop
-c.resize_display("dev", 1320, 800)  # bounded, asynchronous client resize
+c.resize_display("dev", 1320, 800)  # native client applied; guest convergence follows
 ...
 c.close_display("dev")              # or the user just closes it with the [X]
 ```
@@ -294,9 +294,10 @@ c.close_display("dev")              # or the user just closes it with the [X]
   (foregrounding it).
 - **Resize stays process-owned.** `resize_display` accepts only an already-open
   VM display and bounded client dimensions. The elevated daemon marshals the
-  request to that window's owning thread; the existing `WM_SIZE` path then
-  coalesces and forwards the matching guest display mode. Clients should wait
-  for their ordinary display/guest convergence receipt after the `202` response.
+  request to that window's owning thread and returns `202` only after its client
+  rectangle exactly matches. The existing `WM_SIZE` path then coalesces and
+  forwards the matching guest display mode. Clients should wait for their
+  ordinary guest convergence receipt after the native acknowledgement.
 - **Local desktop only.** The window shows on the session the daemon runs in. A
   non-interactive session (a service/SSH daemon with no visible desktop) can't
   show one, so `open_display` returns `409 no_display` rather than spawning an

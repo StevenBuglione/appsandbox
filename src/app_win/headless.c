@@ -973,14 +973,20 @@ static int handle_request(PHTTP_REQUEST req)
                 if (!json_get_int(body, L"width", &width) ||
                     !json_get_int(body, L"height", &height) ||
                     width < 320 || height < 180 ||
-                    width > 7680 || height > 4320 ||
-                    !vm_display_idd_resize(e->disp, (UINT)width, (UINT)height)) {
+                    width > 7680 || height > 4320) {
                     send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                              "display resize dimensions are missing or outside the supported range");
                     return 0;
                 }
+                if (!vm_display_idd_resize(e->disp, (UINT)width, (UINT)height)) {
+                    send_err(req->RequestId, 500, "Internal Server Error",
+                             "display_resize_failed",
+                             "the owned native display did not apply the requested client size");
+                    return 0;
+                }
                 send_json(req->RequestId, 202, "Accepted",
-                          "{\"ok\":true,\"displayOpen\":true,\"resizeAccepted\":true}");
+                          "{\"ok\":true,\"displayOpen\":true,\"resizeAccepted\":true,"
+                          "\"nativeResizeApplied\":true}");
                 return 0;
             }
             if (verb == HttpVerbDELETE) {
