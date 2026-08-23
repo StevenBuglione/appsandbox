@@ -250,6 +250,8 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("TBPF_INDETERMINATE", source)
         self.assertIn("startup presentation is available only in application mode", api)
         self.assertIn("SPI_GETCLIENTAREAANIMATION", scene)
+        self.assertIn("vm_startup_scene_refresh_system_settings", source)
+        self.assertIn("startup_settings_changed", source)
         self.assertIn("First launch can take a little longer", scene)
         self.assertNotIn("CreateWindowEx", scene)
 
@@ -259,6 +261,15 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("SPI_GETHIGHCONTRAST", chrome)
         self.assertNotIn("WM_NCCALCSIZE", source)
         self.assertIn("WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN", source)
+
+        project = (root / "AppSandbox.vcxproj").read_text(encoding="utf-8")
+        preview_project = (
+            root / "tools" / "native-startup-preview" /
+            "NativeStartupPreview.vcxproj"
+        ).read_text(encoding="utf-8")
+        self.assertIn("/utf-8", project)
+        self.assertIn("/utf-8", preview_project)
+        self.assertIn("TreatWarningAsError", preview_project)
 
     def test_display_state_exposes_monotonic_native_presentation_progress(self):
         root = Path(__file__).resolve().parents[3]

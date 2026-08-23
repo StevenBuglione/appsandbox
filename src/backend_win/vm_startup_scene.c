@@ -228,10 +228,30 @@ static void draw_status(VmStartupScene *scene, AsbStartupPhase phase,
     HFONT detail_font = scene_font(scene->dpi, 10, FW_NORMAL);
     HGDIOBJ old_font;
     int glyph_width = scaled(28, scene->dpi);
+    UINT message_format = DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+                          DT_END_ELLIPSIS | DT_NOPREFIX;
 
     fill_rect(scene->dc, &scene->status_rect, scene->background_color);
     SetBkMode(scene->dc, TRANSPARENT);
 
+    if (scene->position == ASB_STARTUP_CENTER && message_font) {
+        SIZE extent = {0};
+        int available = scene->status_rect.right - scene->status_rect.left;
+        int message_width;
+        old_font = SelectObject(scene->dc, message_font);
+        GetTextExtentPoint32W(scene->dc, message, (int)wcslen(message), &extent);
+        SelectObject(scene->dc, old_font);
+        message_width = extent.cx;
+        if (message_width > available - glyph_width)
+            message_width = available - glyph_width;
+        if (message_width < 0) message_width = 0;
+        glyph_rect.left = scene->status_rect.left +
+            (available - glyph_width - message_width) / 2;
+        message_rect.left = glyph_rect.left + glyph_width;
+        message_rect.right = message_rect.left + message_width;
+    } else {
+        message_rect.left += glyph_width;
+    }
     glyph_rect.right = glyph_rect.left + glyph_width;
     glyph_rect.bottom = glyph_rect.top + scaled(30, scene->dpi);
     SetTextColor(scene->dc, scene->accent_color);
@@ -240,12 +260,10 @@ static void draw_status(VmStartupScene *scene, AsbStartupPhase phase,
               glyphs[scene->spinner_frame % ARRAYSIZE(glyphs)], -1,
               &glyph_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
-    message_rect.left += glyph_width;
     message_rect.bottom = message_rect.top + scaled(30, scene->dpi);
     SetTextColor(scene->dc, scene->foreground_color);
     DrawTextW(scene->dc, message, -1, &message_rect,
-              (scene->position == ASB_STARTUP_CENTER ? DT_CENTER : DT_LEFT) |
-              DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+              message_format);
 
     if (old_font) SelectObject(scene->dc, old_font);
     if (detailed)
@@ -321,6 +339,15 @@ VmStartupScene *vm_startup_scene_create(const AsbStartupOptions *options)
     }
     scene->painted_phase = ASB_STARTUP_DISABLED;
     return scene;
+}
+
+void vm_startup_scene_refresh_system_settings(VmStartupScene *scene)
+{
+    BOOL animations = TRUE;
+    if (!scene) return;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
+    scene->animations_enabled =
+        scene->motion == ASB_STARTUP_MOTION_GLYPH && animations;
 }
 
 void vm_startup_scene_destroy(VmStartupScene *scene)
