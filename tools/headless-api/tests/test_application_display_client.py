@@ -28,7 +28,14 @@ class ApplicationDisplayClientTests(unittest.TestCase):
             client.open_display("vm", **options)
         request.assert_called_once_with("POST", "/vms/vm/display", options)
 
+    def test_resize_is_scoped_to_one_open_display(self):
+        client = asb.Client("http://127.0.0.1:1", "token")
+        with patch.object(client, "_req", return_value=(202, {})) as request:
+            client.resize_display("vm", 1320, 800)
+        request.assert_called_once_with(
+            "PUT", "/vms/vm/display", {"width": 1320, "height": 800}
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
-

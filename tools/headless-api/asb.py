@@ -149,6 +149,10 @@ class Client:
         normal App Sandbox display window."""
         return self._req("POST", "/vms/%s/display" % name, options or None)
     def close_display(self, name): return self._req("DELETE", "/vms/%s/display" % name)
+    def resize_display(self, name, width, height):
+        """Resize one already-open display client through its owning daemon."""
+        return self._req("PUT", "/vms/%s/display" % name,
+                         {"width": width, "height": height})
     def display_status(self, name):
         """{'open': bool, 'ready': bool}. 'ready' is the agent's own report that the
         display driver is up (running + agentOnline + idd_status) -- a passive flag,

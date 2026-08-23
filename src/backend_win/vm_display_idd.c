@@ -146,6 +146,7 @@ typedef struct InputPacket {
 #define WM_VM_DISPLAY_CLOSED    (WM_APP + 5)
 #define WM_IDD_FRAME_READY      (WM_USER + 100)
 #define WM_IDD_FOCUS            (WM_USER + 101)
+#define WM_IDD_RESIZE           (WM_USER + 102)
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -2693,6 +2694,26 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SetForegroundWindow(hwnd);
         return 0;
 
+    /* Posted by the authenticated headless API. Keep all HWND mutation on the
+       owning window thread so an unelevated client never needs window access. */
+    case WM_IDD_RESIZE:
+        if (d) {
+            UINT width = (UINT)wp;
+            UINT height = (UINT)lp;
+            DWORD style = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
+            DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
+            UINT dpi = GetDpiForWindow(hwnd);
+            RECT wr = { 0, 0, (LONG)width, (LONG)height };
+            if (width < d->minimum_width || height < d->minimum_height ||
+                width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
+                return 0;
+            AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, dpi);
+            SetWindowPos(hwnd, NULL, 0, 0,
+                         wr.right - wr.left, wr.bottom - wr.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return 0;
+
     case WM_SETFOCUS:
         if (d && d->clipboard)
             vm_clipboard_set_sync_enabled(d->clipboard, TRUE);
@@ -3051,4 +3072,15 @@ void vm_display_idd_focus(VmDisplayIdd *display)
     /* Marshal to the window thread; that thread owns the window and runs
        the activation (restore-if-minimized + foreground) in WM_IDD_FOCUS. */
     PostMessageW(display->hwnd, WM_IDD_FOCUS, 0, 0);
+}
+
+BOOL vm_display_idd_resize(VmDisplayIdd *display, UINT width, UINT height)
+{
+    if (!display || !display->open ||
+        !display->hwnd || !IsWindow(display->hwnd) ||
+        width < display->minimum_width || height < display->minimum_height ||
+        width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
+        return FALSE;
+    return PostMessageW(display->hwnd, WM_IDD_RESIZE,
+                        (WPARAM)width, (LPARAM)height);
 }

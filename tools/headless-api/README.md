@@ -264,6 +264,7 @@ it (good in the GUI, wrong for a CLI).
 | `display_status(name)` | `{open, ready}` — poll this; **no window is opened by polling** |
 | `display_ready(name)` | `bool` — shorthand for `display_status()["ready"]` |
 | `open_display(name)` | `(status, body)` — open (or focus) the window |
+| `resize_display(name, width, height)` | `(status, body)` — resize one open client through its owning daemon |
 | `close_display(name)` | `(status, body)` — close it |
 
 The pattern is **poll-then-open**:
@@ -273,6 +274,7 @@ c.start("dev")
 while not c.display_ready("dev"):    # running + agentOnline + agent says display driver up
     time.sleep(1)
 c.open_display("dev")                # a window appears on the daemon's desktop
+c.resize_display("dev", 1320, 800)  # bounded, asynchronous client resize
 ...
 c.close_display("dev")              # or the user just closes it with the [X]
 ```
@@ -290,6 +292,11 @@ c.close_display("dev")              # or the user just closes it with the [X]
   it closed — `close_display`, the window's `[X]`, VM delete, and daemon exit all
   drive it false. `open_display` on an already-open VM just focuses the window
   (foregrounding it).
+- **Resize stays process-owned.** `resize_display` accepts only an already-open
+  VM display and bounded client dimensions. The elevated daemon marshals the
+  request to that window's owning thread; the existing `WM_SIZE` path then
+  coalesces and forwards the matching guest display mode. Clients should wait
+  for their ordinary display/guest convergence receipt after the `202` response.
 - **Local desktop only.** The window shows on the session the daemon runs in. A
   non-interactive session (a service/SSH daemon with no visible desktop) can't
   show one, so `open_display` returns `409 no_display` rather than spawning an

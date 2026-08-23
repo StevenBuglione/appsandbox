@@ -960,6 +960,29 @@ static int handle_request(PHTTP_REQUEST req)
                 send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"displayOpen\":true}");
                 return 0;
             }
+            if (verb == HttpVerbPUT) {
+                DisplayEntry *e = display_find(v->unique_id);
+                wchar_t body[512];
+                int width = 0, height = 0;
+                if (!e || !e->disp) {
+                    send_err(req->RequestId, 409, "Conflict", "display_not_open",
+                             "the VM display must be open before it can be resized");
+                    return 0;
+                }
+                body_to_wide(req, body, 512);
+                if (!json_get_int(body, L"width", &width) ||
+                    !json_get_int(body, L"height", &height) ||
+                    width < 320 || height < 180 ||
+                    width > 7680 || height > 4320 ||
+                    !vm_display_idd_resize(e->disp, (UINT)width, (UINT)height)) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "display resize dimensions are missing or outside the supported range");
+                    return 0;
+                }
+                send_json(req->RequestId, 202, "Accepted",
+                          "{\"ok\":true,\"displayOpen\":true,\"resizeAccepted\":true}");
+                return 0;
+            }
             if (verb == HttpVerbDELETE) {
                 display_drop(display_find(v->unique_id));
                 send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"displayOpen\":false}");
@@ -979,7 +1002,7 @@ static int handle_request(PHTTP_REQUEST req)
                 return 0;
             }
             send_err(req->RequestId, 405, "Method Not Allowed", "method",
-                     "use GET to poll state, POST to open the display, DELETE to close it");
+                     "use GET to poll state, POST to open, PUT to resize, DELETE to close the display");
             return 0;
         }
 

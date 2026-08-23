@@ -38,4 +38,8 @@ BOOL vm_display_idd_is_open(VmDisplayIdd *display);
    Safe to call from any thread; the work is marshaled to the window thread. */
 void vm_display_idd_focus(VmDisplayIdd *display);
 
+/* Resize the exact owned display client from the window-owning thread. The
+   request is asynchronous; WM_SIZE drives the existing guest resize path. */
+BOOL vm_display_idd_resize(VmDisplayIdd *display, UINT width, UINT height);
+
 #endif /* VM_DISPLAY_IDD_H */
