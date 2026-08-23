@@ -3,6 +3,8 @@
 
 #include <windows.h>
 #include "hcs_vm.h"
+#include "vm_startup_scene.h"
+#include "vm_window_chrome.h"
 
 typedef struct VmDisplayIdd VmDisplayIdd;
 
@@ -15,6 +17,9 @@ typedef struct AsbDisplayRuntimeState {
     UINT render_height;
     UINT frame_width;
     UINT frame_height;
+    BOOL startup_visible;
+    BOOL startup_detailed;
+    AsbStartupPhase startup_phase;
 } AsbDisplayRuntimeState;
 
 typedef struct AsbDisplayOptions {
@@ -28,6 +33,8 @@ typedef struct AsbDisplayOptions {
     UINT minimum_height;
     BOOL show_debug_title;
     BOOL show_debug_overlay;
+    AsbWindowChromeOptions window_chrome;
+    AsbStartupOptions startup;
 } AsbDisplayOptions;
 
 /* Create IDD display window for VM. Connects to VM's AF_HYPERV channels
@@ -59,6 +66,13 @@ BOOL vm_display_idd_resize(VmDisplayIdd *display, UINT width, UINT height);
    arbitrary window message. During the transaction, only the newest client
    geometry is rendered; ending it commits one guest modeset. */
 BOOL vm_display_idd_set_resize_phase(VmDisplayIdd *display, BOOL active);
+
+/* Update the bounded, non-technical startup presentation. The native renderer
+   keeps the startup scene visible until READY and one complete guest frame are
+   both available. No arbitrary status text or native call crosses this API. */
+BOOL vm_display_idd_set_startup_state(VmDisplayIdd *display,
+                                      AsbStartupPhase phase,
+                                      BOOL detailed);
 
 /* Send bounded pointer gestures through the input channel already owned by
    this exact display. Coordinates are guest-frame coordinates; no HWND,

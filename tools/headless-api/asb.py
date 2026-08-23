@@ -159,6 +159,12 @@ class Client:
     def end_display_resize(self, name):
         """End the resize and commit its newest geometry to the guest once."""
         return self._req("PUT", "/vms/%s/display" % name, {"phase": "end"})
+    def set_display_startup_state(self, name, phase, detailed=None):
+        """Update one display's bounded host-owned startup presentation."""
+        body = {"startupPhase": phase}
+        if detailed is not None:
+            body["startupDetailed"] = bool(detailed)
+        return self._req("PUT", "/vms/%s/display" % name, body)
     def click_display(self, name, x, y):
         """Click one bounded guest-frame point through the open display."""
         return self._req("PUT", "/vms/%s/display" % name,

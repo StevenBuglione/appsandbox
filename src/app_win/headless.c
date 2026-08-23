@@ -110,6 +110,42 @@ static BOOL host_can_show_window(void)
     return FALSE;
 }
 
+static int hex_digit(wchar_t value)
+{
+    if (value >= L'0' && value <= L'9') return value - L'0';
+    if (value >= L'a' && value <= L'f') return value - L'a' + 10;
+    if (value >= L'A' && value <= L'F') return value - L'A' + 10;
+    return -1;
+}
+
+static BOOL parse_css_color(const wchar_t *value, COLORREF *color)
+{
+    int digits[6];
+    int i;
+    if (!value || !color || wcslen(value) != 7 || value[0] != L'#')
+        return FALSE;
+    for (i = 0; i < 6; i++) {
+        digits[i] = hex_digit(value[i + 1]);
+        if (digits[i] < 0) return FALSE;
+    }
+    *color = RGB(digits[0] * 16 + digits[1],
+                 digits[2] * 16 + digits[3],
+                 digits[4] * 16 + digits[5]);
+    return TRUE;
+}
+
+static const char *startup_phase_name(AsbStartupPhase phase)
+{
+    switch (phase) {
+    case ASB_STARTUP_OPENING: return "opening";
+    case ASB_STARTUP_PREPARING: return "preparing";
+    case ASB_STARTUP_FINISHING: return "finishing";
+    case ASB_STARTUP_READY: return "ready";
+    case ASB_STARTUP_FAILED: return "failed";
+    default: return "disabled";
+    }
+}
+
 /* ---- Logging ---- */
 
 static FILE            *g_log;
@@ -842,16 +878,36 @@ static int handle_request(PHTTP_REQUEST req)
             if (verb == HttpVerbPOST) {
                 DisplayEntry *e;
                 AsbDisplayOptions display_options;
-                wchar_t body[2048];
+                wchar_t body[8192];
                 wchar_t mode[32] = {0};
                 wchar_t title[256] = L"Linguum Runtime POC";
                 wchar_t app_id[256] = L"com.linguum.Runtime.POC";
                 wchar_t icon_path[MAX_PATH] = {0};
+                wchar_t title_bar_theme[16] = L"dark";
+                wchar_t title_bar_corner[24] = L"system";
+                wchar_t caption_color[16] = {0};
+                wchar_t caption_text_color[16] = {0};
+                wchar_t border_color[16] = {0};
+                wchar_t startup_preset[24] = {0};
+                wchar_t startup_ready_mode[24] = L"first-frame";
+                wchar_t startup_position[24] = L"bottom-left";
+                wchar_t startup_motion[16] = L"glyph";
+                wchar_t startup_background[16] = L"#111318";
+                wchar_t startup_foreground[16] = L"#f6f4fb";
+                wchar_t startup_accent[16] = L"#c9b6ff";
+                wchar_t startup_mark_path[MAX_PATH] = {0};
+                wchar_t startup_opening[192] = {0};
+                wchar_t startup_preparing[192] = L"Getting things ready…";
+                wchar_t startup_finishing[192] = L"Almost there…";
+                wchar_t startup_delayed[192] = L"First launch can take a little longer.";
+                wchar_t startup_failed[192] = L"Something got in the way.";
+                wchar_t startup_failure_detail[192] = {0};
+                COLORREF parsed_color;
                 int iv;
                 BOOL bv;
 
                 ZeroMemory(&display_options, sizeof(display_options));
-                body_to_wide(req, body, 2048);
+                body_to_wide(req, body, 8192);
                 json_get_string(body, L"mode", mode, 32);
                 trim_ws(mode);
                 if (mode[0] && _wcsicmp(mode, L"application") != 0 &&
@@ -867,10 +923,32 @@ static int handle_request(PHTTP_REQUEST req)
                 display_options.minimum_height = display_options.app_mode ? 500 : 180;
                 display_options.show_debug_title = !display_options.app_mode;
                 display_options.show_debug_overlay = !display_options.app_mode;
+                display_options.window_chrome.theme = ASB_TITLE_BAR_DARK;
+                display_options.window_chrome.corner_preference =
+                    ASB_WINDOW_CORNER_SYSTEM;
 
                 json_get_string(body, L"title", title, 256);
                 json_get_string(body, L"appUserModelId", app_id, 256);
                 json_get_string(body, L"iconPath", icon_path, MAX_PATH);
+                json_get_string(body, L"titleBarTheme", title_bar_theme, 16);
+                json_get_string(body, L"titleBarCorner", title_bar_corner, 24);
+                json_get_string(body, L"captionColor", caption_color, 16);
+                json_get_string(body, L"captionTextColor", caption_text_color, 16);
+                json_get_string(body, L"borderColor", border_color, 16);
+                json_get_string(body, L"startupPreset", startup_preset, 24);
+                json_get_string(body, L"startupReadyMode", startup_ready_mode, 24);
+                json_get_string(body, L"startupPosition", startup_position, 24);
+                json_get_string(body, L"startupMotion", startup_motion, 16);
+                json_get_string(body, L"startupBackgroundColor", startup_background, 16);
+                json_get_string(body, L"startupForegroundColor", startup_foreground, 16);
+                json_get_string(body, L"startupAccentColor", startup_accent, 16);
+                json_get_string(body, L"startupMarkPath", startup_mark_path, MAX_PATH);
+                json_get_string(body, L"startupOpeningMessage", startup_opening, 192);
+                json_get_string(body, L"startupPreparingMessage", startup_preparing, 192);
+                json_get_string(body, L"startupFinishingMessage", startup_finishing, 192);
+                json_get_string(body, L"startupDelayedMessage", startup_delayed, 192);
+                json_get_string(body, L"startupFailedMessage", startup_failed, 192);
+                json_get_string(body, L"startupFailureDetail", startup_failure_detail, 192);
                 if (json_get_int(body, L"width", &iv))
                     display_options.initial_width = (UINT)iv;
                 if (json_get_int(body, L"height", &iv))
@@ -883,9 +961,14 @@ static int handle_request(PHTTP_REQUEST req)
                     display_options.show_debug_title = bv;
                 if (json_get_bool(body, L"showDebugOverlay", &bv))
                     display_options.show_debug_overlay = bv;
+                if (json_get_bool(body, L"startupDetailed", &bv))
+                    display_options.startup.detailed = bv;
+                if (json_get_int(body, L"startupDelayMs", &iv))
+                    display_options.startup.delayed_message_after_ms = (UINT)iv;
                 trim_ws(title);
                 trim_ws(app_id);
                 trim_ws(icon_path);
+                trim_ws(startup_mark_path);
 
                 if (display_options.initial_width < 320 ||
                     display_options.initial_height < 180 ||
@@ -897,6 +980,118 @@ static int handle_request(PHTTP_REQUEST req)
                     display_options.minimum_height > display_options.initial_height) {
                     send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                              "display dimensions are outside the supported range");
+                    return 0;
+                }
+                if (_wcsicmp(title_bar_theme, L"system") == 0) {
+                    display_options.window_chrome.theme = ASB_TITLE_BAR_SYSTEM;
+                } else if (_wcsicmp(title_bar_theme, L"light") == 0) {
+                    display_options.window_chrome.theme = ASB_TITLE_BAR_LIGHT;
+                } else if (_wcsicmp(title_bar_theme, L"dark") != 0) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "titleBarTheme must be 'system', 'light', or 'dark'");
+                    return 0;
+                }
+                if (_wcsicmp(title_bar_corner, L"system") == 0) {
+                    display_options.window_chrome.corner_preference =
+                        ASB_WINDOW_CORNER_SYSTEM;
+                } else if (_wcsicmp(title_bar_corner, L"rounded") == 0) {
+                    display_options.window_chrome.corner_preference =
+                        ASB_WINDOW_CORNER_ROUNDED;
+                } else if (_wcsicmp(title_bar_corner, L"rounded-small") == 0) {
+                    display_options.window_chrome.corner_preference =
+                        ASB_WINDOW_CORNER_ROUNDED_SMALL;
+                } else if (_wcsicmp(title_bar_corner, L"square") == 0) {
+                    display_options.window_chrome.corner_preference =
+                        ASB_WINDOW_CORNER_SQUARE;
+                } else {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "titleBarCorner is outside the supported set");
+                    return 0;
+                }
+                if (caption_color[0]) {
+                    if (!parse_css_color(caption_color, &parsed_color)) {
+                        send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                                 "captionColor must be #RRGGBB");
+                        return 0;
+                    }
+                    display_options.window_chrome.has_caption_color = TRUE;
+                    display_options.window_chrome.caption_color = parsed_color;
+                }
+                if (caption_text_color[0]) {
+                    if (!parse_css_color(caption_text_color, &parsed_color)) {
+                        send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                                 "captionTextColor must be #RRGGBB");
+                        return 0;
+                    }
+                    display_options.window_chrome.has_text_color = TRUE;
+                    display_options.window_chrome.text_color = parsed_color;
+                }
+                if (border_color[0]) {
+                    if (!parse_css_color(border_color, &parsed_color)) {
+                        send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                                 "borderColor must be #RRGGBB");
+                        return 0;
+                    }
+                    display_options.window_chrome.has_border_color = TRUE;
+                    display_options.window_chrome.border_color = parsed_color;
+                }
+
+                if (startup_preset[0] &&
+                    _wcsicmp(startup_preset, L"none") != 0 &&
+                    _wcsicmp(startup_preset, L"thinking") != 0) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "startupPreset must be 'none' or 'thinking'");
+                    return 0;
+                }
+                display_options.startup.enabled =
+                    _wcsicmp(startup_preset, L"thinking") == 0;
+                if (display_options.startup.enabled && !display_options.app_mode) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "startup presentation is available only in application mode");
+                    return 0;
+                }
+                if (_wcsicmp(startup_ready_mode, L"first-frame") == 0) {
+                    display_options.startup.auto_ready = TRUE;
+                } else if (_wcsicmp(startup_ready_mode, L"manual") == 0) {
+                    display_options.startup.auto_ready = FALSE;
+                } else {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "startupReadyMode must be 'first-frame' or 'manual'");
+                    return 0;
+                }
+                if (_wcsicmp(startup_position, L"bottom-left") == 0) {
+                    display_options.startup.position = ASB_STARTUP_BOTTOM_LEFT;
+                } else if (_wcsicmp(startup_position, L"center") == 0) {
+                    display_options.startup.position = ASB_STARTUP_CENTER;
+                } else {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "startupPosition must be 'bottom-left' or 'center'");
+                    return 0;
+                }
+                if (_wcsicmp(startup_motion, L"glyph") == 0) {
+                    display_options.startup.motion = ASB_STARTUP_MOTION_GLYPH;
+                } else if (_wcsicmp(startup_motion, L"none") == 0) {
+                    display_options.startup.motion = ASB_STARTUP_MOTION_NONE;
+                } else {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "startupMotion must be 'glyph' or 'none'");
+                    return 0;
+                }
+                if (!parse_css_color(startup_background,
+                                     &display_options.startup.background_color) ||
+                    !parse_css_color(startup_foreground,
+                                     &display_options.startup.foreground_color) ||
+                    !parse_css_color(startup_accent,
+                                     &display_options.startup.accent_color)) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "startup colors must use #RRGGBB");
+                    return 0;
+                }
+                if (display_options.startup.delayed_message_after_ms &&
+                    (display_options.startup.delayed_message_after_ms < 1000 ||
+                     display_options.startup.delayed_message_after_ms > 120000)) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "startupDelayMs must be between 1000 and 120000");
                     return 0;
                 }
                 if (display_options.app_mode && !title[0]) {
@@ -912,9 +1107,43 @@ static int handle_request(PHTTP_REQUEST req)
                              "iconPath must be absolute");
                     return 0;
                 }
+                if (startup_mark_path[0] &&
+                    !((wcslen(startup_mark_path) >= 3 &&
+                       startup_mark_path[1] == L':' &&
+                       (startup_mark_path[2] == L'\\' ||
+                        startup_mark_path[2] == L'/')) ||
+                      (startup_mark_path[0] == L'\\' &&
+                       startup_mark_path[1] == L'\\'))) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "startupMarkPath must be absolute");
+                    return 0;
+                }
+                if (!startup_opening[0])
+                    swprintf_s(startup_opening, ARRAYSIZE(startup_opening),
+                               L"%s is waking up…", title);
                 display_options.window_title = title;
                 display_options.app_user_model_id = app_id;
                 display_options.icon_path = icon_path;
+                display_options.startup.app_name = title;
+                display_options.startup.opening_message = startup_opening;
+                display_options.startup.preparing_message = startup_preparing;
+                display_options.startup.finishing_message = startup_finishing;
+                display_options.startup.delayed_message = startup_delayed;
+                display_options.startup.failed_message = startup_failed;
+                display_options.startup.failure_detail = startup_failure_detail;
+                display_options.startup.mark_path = startup_mark_path;
+                if (display_options.startup.enabled) {
+                    if (!display_options.window_chrome.has_caption_color) {
+                        display_options.window_chrome.has_caption_color = TRUE;
+                        display_options.window_chrome.caption_color =
+                            display_options.startup.background_color;
+                    }
+                    if (!display_options.window_chrome.has_text_color) {
+                        display_options.window_chrome.has_text_color = TRUE;
+                        display_options.window_chrome.text_color =
+                            display_options.startup.foreground_color;
+                    }
+                }
 
                 if (!host_can_show_window()) {
                     send_err(req->RequestId, 409, "Conflict", "no_display",
@@ -931,7 +1160,7 @@ static int handle_request(PHTTP_REQUEST req)
                    agent's latched idd_status (display driver up). It never probes the
                    frame channel, so the check itself can't steal the single consumer
                    slot or blank the display the way a connect-test would. */
-                if (!asb_vm_idd_ready(vm)) {
+                if (!display_options.startup.enabled && !asb_vm_idd_ready(vm)) {
                     send_err(req->RequestId, 409, "Conflict", "display_not_ready",
                              "the VM's virtual display driver is not up yet; retry shortly");
                     return 0;
@@ -966,16 +1195,51 @@ static int handle_request(PHTTP_REQUEST req)
             }
             if (verb == HttpVerbPUT) {
                 DisplayEntry *e = display_find(v->unique_id);
-                wchar_t body[512];
+                wchar_t body[1024];
                 wchar_t phase[16] = L"";
                 wchar_t input[16] = L"";
+                wchar_t startup_phase[24] = L"";
                 int width = 0, height = 0;
                 if (!e || !e->disp) {
                     send_err(req->RequestId, 409, "Conflict", "display_not_open",
                              "the VM display must be open before it can be resized");
                     return 0;
                 }
-                body_to_wide(req, body, 512);
+                body_to_wide(req, body, 1024);
+                if (json_get_string(body, L"startupPhase", startup_phase, 24)) {
+                    AsbStartupPhase next_phase;
+                    AsbDisplayRuntimeState state;
+                    BOOL detailed = FALSE;
+                    if (_wcsicmp(startup_phase, L"opening") == 0)
+                        next_phase = ASB_STARTUP_OPENING;
+                    else if (_wcsicmp(startup_phase, L"preparing") == 0)
+                        next_phase = ASB_STARTUP_PREPARING;
+                    else if (_wcsicmp(startup_phase, L"finishing") == 0)
+                        next_phase = ASB_STARTUP_FINISHING;
+                    else if (_wcsicmp(startup_phase, L"ready") == 0)
+                        next_phase = ASB_STARTUP_READY;
+                    else if (_wcsicmp(startup_phase, L"failed") == 0)
+                        next_phase = ASB_STARTUP_FAILED;
+                    else {
+                        send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                                 "startupPhase is outside the supported set");
+                        return 0;
+                    }
+                    if (vm_display_idd_get_runtime_state(e->disp, &state))
+                        detailed = state.startup_detailed;
+                    json_get_bool(body, L"startupDetailed", &detailed);
+                    if (!vm_display_idd_set_startup_state(
+                            e->disp, next_phase, detailed)) {
+                        send_err(req->RequestId, 409, "Conflict",
+                                 "startup_state_unavailable",
+                                 "the display has no active startup presentation");
+                        return 0;
+                    }
+                    send_json(req->RequestId, 202, "Accepted",
+                              "{\"ok\":true,\"displayOpen\":true,"
+                              "\"startupStateApplied\":true}");
+                    return 0;
+                }
                 if (json_get_string(body, L"input", input, 16)) {
                     int x = 0, y = 0, end_x = 0, end_y = 0, steps = 0;
                     if (!json_get_int(body, L"x", &x) || !json_get_int(body, L"y", &y) ||
@@ -1072,7 +1336,7 @@ static int handle_request(PHTTP_REQUEST req)
                    asb_vm_idd_ready: running + agent-online + the agent's latched
                    idd_status flag, so a client can poll this on an interval (it disturbs
                    nothing) and POST to open once ready. */
-                char b[512];
+                char b[768];
                 DisplayEntry *e = display_find(v->unique_id);
                 BOOL open = e && e->disp && vm_display_idd_is_open(e->disp);
                 BOOL ready = open || asb_vm_idd_ready(vm);
@@ -1083,11 +1347,16 @@ static int handle_request(PHTTP_REQUEST req)
                               "\"receivedFrames\":%llu,\"presentedFrames\":%llu,"
                               "\"presentCount\":%llu,\"guestFrameSequence\":%llu,"
                               "\"renderWidth\":%u,\"renderHeight\":%u,"
-                              "\"frameWidth\":%u,\"frameHeight\":%u}",
+                              "\"frameWidth\":%u,\"frameHeight\":%u,"
+                              "\"startupVisible\":%s,\"startupDetailed\":%s,"
+                              "\"startupPhase\":\"%s\"}",
                               state.received_frames, state.presented_frames,
                               state.present_count, state.guest_frame_sequence,
                               state.render_width, state.render_height,
-                              state.frame_width, state.frame_height);
+                              state.frame_width, state.frame_height,
+                              state.startup_visible ? "true" : "false",
+                              state.startup_detailed ? "true" : "false",
+                              startup_phase_name(state.startup_phase));
                 } else {
                     sprintf_s(b, sizeof(b), "{\"open\":false,\"ready\":%s}",
                               ready ? "true" : "false");

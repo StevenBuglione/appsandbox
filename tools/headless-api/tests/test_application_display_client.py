@@ -29,6 +29,44 @@ class ApplicationDisplayClientTests(unittest.TestCase):
             client.open_display("vm", **options)
         request.assert_called_once_with("POST", "/vms/vm/display", options)
 
+    def test_customizable_thinking_startup_is_forwarded_without_vm_terms(self):
+        client = asb.Client("http://127.0.0.1:1", "token")
+        options = {
+            "mode": "application",
+            "title": "My App",
+            "startupPreset": "thinking",
+            "startupReadyMode": "manual",
+            "startupPosition": "bottom-left",
+            "startupMotion": "glyph",
+            "startupBackgroundColor": "#111318",
+            "startupForegroundColor": "#f6f4fb",
+            "startupAccentColor": "#c9b6ff",
+            "startupOpeningMessage": "My App is waking up…",
+            "titleBarTheme": "system",
+            "titleBarCorner": "rounded",
+        }
+        with patch.object(client, "_req", return_value=(200, {})) as request:
+            client.open_display("vm", **options)
+        request.assert_called_once_with("POST", "/vms/vm/display", options)
+
+    def test_startup_state_is_scoped_to_one_owned_display(self):
+        client = asb.Client("http://127.0.0.1:1", "token")
+        with patch.object(client, "_req", return_value=(202, {})) as request:
+            client.set_display_startup_state("vm", "finishing")
+            client.set_display_startup_state("vm", "ready", detailed=True)
+        self.assertEqual(
+            request.call_args_list,
+            [
+                unittest.mock.call(
+                    "PUT", "/vms/vm/display", {"startupPhase": "finishing"}
+                ),
+                unittest.mock.call(
+                    "PUT", "/vms/vm/display",
+                    {"startupPhase": "ready", "startupDetailed": True},
+                ),
+            ],
+        )
+
     def test_resize_is_scoped_to_one_open_display(self):
         client = asb.Client("http://127.0.0.1:1", "token")
         with patch.object(client, "_req", return_value=(202, {})) as request:
@@ -185,6 +223,42 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("d3d_resize_swap_chain(d, desired_width, desired_height)", render_worker)
         self.assertIn("d3d_render_frame(d)", render_worker)
         self.assertIn("d3d_cleanup(d)", render_worker)
+
+    def test_startup_scene_uses_the_existing_native_swap_chain(self):
+        root = Path(__file__).resolve().parents[3]
+        source = (root / "src" / "backend_win" / "vm_display_idd.c").read_text(
+            encoding="utf-8"
+        )
+        scene = (root / "src" / "backend_win" / "vm_startup_scene.c").read_text(
+            encoding="utf-8"
+        )
+        chrome = (root / "src" / "backend_win" / "vm_window_chrome.c").read_text(
+            encoding="utf-8"
+        )
+        api = (root / "src" / "app_win" / "headless.c").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("startup_srv", source)
+        self.assertIn("d3d_update_startup_texture", source)
+        self.assertIn("display_srv = startup_active ? d->startup_srv : d->frame_srv", source)
+        self.assertIn("if (!d->startup_enabled)", source)
+        self.assertIn("vm_startup_scene_is_animated", source)
+        self.assertIn("startupVisible", api)
+        self.assertIn("startupPhase", api)
+        self.assertIn("SetProgressState", source)
+        self.assertIn("TBPF_INDETERMINATE", source)
+        self.assertIn("startup presentation is available only in application mode", api)
+        self.assertIn("SPI_GETCLIENTAREAANIMATION", scene)
+        self.assertIn("First launch can take a little longer", scene)
+        self.assertNotIn("CreateWindowEx", scene)
+
+        self.assertIn("DWMWA_CAPTION_COLOR", chrome)
+        self.assertIn("DWMWA_TEXT_COLOR", chrome)
+        self.assertIn("DWMWA_BORDER_COLOR", chrome)
+        self.assertIn("SPI_GETHIGHCONTRAST", chrome)
+        self.assertNotIn("WM_NCCALCSIZE", source)
+        self.assertIn("WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN", source)
 
     def test_display_state_exposes_monotonic_native_presentation_progress(self):
         root = Path(__file__).resolve().parents[3]
