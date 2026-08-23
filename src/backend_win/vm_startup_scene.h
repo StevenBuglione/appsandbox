@@ -69,5 +69,6 @@ BOOL vm_startup_scene_render(VmStartupScene *scene,
                              VmStartupSceneFrame *frame);
 
 BOOL vm_startup_scene_is_animated(const VmStartupScene *scene);
+void vm_startup_scene_refresh_system_settings(VmStartupScene *scene);
 
 #endif /* VM_STARTUP_SCENE_H */

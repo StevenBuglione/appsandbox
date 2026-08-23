@@ -45,17 +45,32 @@ void vm_window_chrome_apply(HWND hwnd,
                             BOOL active)
 {
     BOOL dark;
+    BOOL set_dark;
     BOOL high_contrast;
     DWORD corner;
 
     if (!hwnd || !options) return;
 
     high_contrast = high_contrast_enabled();
-    dark = options->theme != ASB_TITLE_BAR_LIGHT;
-    if (high_contrast)
+    dark = FALSE;
+    set_dark = options->theme != ASB_TITLE_BAR_SYSTEM;
+    if (options->theme == ASB_TITLE_BAR_DARK)
+        dark = TRUE;
+    else if (options->theme == ASB_TITLE_BAR_SYSTEM &&
+             options->has_caption_color) {
+        UINT luminance = 299u * GetRValue(options->caption_color) +
+                         587u * GetGValue(options->caption_color) +
+                         114u * GetBValue(options->caption_color);
+        dark = luminance < 128000u;
+        set_dark = TRUE;
+    }
+    if (high_contrast) {
         dark = FALSE;
-    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                          &dark, sizeof(dark));
+        set_dark = TRUE;
+    }
+    if (set_dark)
+        DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                              &dark, sizeof(dark));
 
     corner = (DWORD)options->corner_preference;
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,

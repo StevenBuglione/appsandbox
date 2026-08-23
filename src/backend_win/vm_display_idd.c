@@ -258,6 +258,7 @@ struct VmDisplayIdd {
     volatile LONG   startup_phase;
     volatile LONG   startup_detailed;
     volatile LONG   startup_visible;
+    volatile LONG   startup_settings_changed;
     VmStartupScene *startup_scene;
     ITaskbarList3  *taskbar;
 
@@ -1620,6 +1621,8 @@ static BOOL d3d_update_startup_texture(VmDisplayIdd *d)
     HRESULT hr;
 
     if (!d || !d->startup_scene) return FALSE;
+    if (InterlockedExchange(&d->startup_settings_changed, 0) != 0)
+        vm_startup_scene_refresh_system_settings(d->startup_scene);
     phase = (AsbStartupPhase)InterlockedCompareExchange(
         &d->startup_phase, 0, 0);
     if (phase == ASB_STARTUP_READY)
@@ -3179,6 +3182,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d && d->app_mode)
             vm_window_chrome_apply(hwnd, &d->window_chrome,
                                    GetActiveWindow() == hwnd);
+        if (d && d->startup_scene)
+            InterlockedExchange(&d->startup_settings_changed, 1);
         idd_request_render(d, FALSE);
         return 0;
 
