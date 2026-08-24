@@ -212,6 +212,12 @@ directory and skips ISO installation while retaining the normal HCS, GPU-PV,
 Plan9, HvSocket, display, input, clipboard, audio, snapshot, and cleanup paths.
 `diskPath` cannot be combined with `imagePath` or `templateName`.
 
+On Windows, `dataDiskPath` optionally attaches one existing caller-owned VHDX
+as a secondary data disk. App Sandbox persists and reattaches the exact path but
+does not copy, format, snapshot, inspect, or delete the disk. It is rejected for
+template creation and must not alias the boot disk. Check
+`capabilities.secondaryDataDisk` before using it.
+
 ### Snapshots & branches *(return `(status, body)`)*
 | Method | Effect |
 |---|---|

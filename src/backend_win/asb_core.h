@@ -129,6 +129,12 @@ ASB_API void asb_set_vm_removed_callback(AsbVmRemovedCallback cb, void *user_dat
    Depending on config, this may start a background VHDX creation thread. */
 ASB_API HRESULT asb_vm_create(const AsbVmConfig *config);
 
+/* Create with one caller-owned secondary VHDX. The disk is attached and its
+   exact path is persisted, but App Sandbox never copies, formats, snapshots,
+   inspects, or deletes it. Existing asb_vm_create ABI remains unchanged. */
+ASB_API HRESULT asb_vm_create_with_data_disk(const AsbVmConfig *config,
+                                              const wchar_t *data_disk_path);
+
 /* Start a VM.
    snap_idx: snapshot index (>= 0), -2 for base, -1 for current disk.
    branch_idx: branch index (>= 0) to resume, or -1 to create a new branch.

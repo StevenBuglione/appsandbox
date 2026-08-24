@@ -615,6 +615,7 @@ static int handle_request(PHTTP_REQUEST req)
         sprintf_s(buf, sizeof(buf),
             "{\"product\":\"AppSandbox\",\"version\":\"%s\",\"apiVersion\":\"%s\",\"hostOs\":\"Windows\","
             "\"capabilities\":{\"snapshots\":true,\"templates\":true,\"prebuiltLinuxDisk\":true,"
+            "\"secondaryDataDisk\":true,"
             "\"applicationDisplay\":true}}",
             ASB_PRODUCT_VER, ASB_API_VERSION);
         send_json(req->RequestId, 200, "OK", buf);
@@ -686,7 +687,8 @@ static int handle_request(PHTTP_REQUEST req)
             /* create */
             wchar_t body[8192];
             AsbVmConfig cfg; int iv; BOOL bv;
-            wchar_t name[256]={0}, os[32]={0}, img[MAX_PATH]={0}, disk[MAX_PATH]={0}, tpl[256]={0};
+            wchar_t name[256]={0}, os[32]={0}, img[MAX_PATH]={0}, disk[MAX_PATH]={0};
+            wchar_t data_disk[MAX_PATH]={0}, tpl[256]={0};
             wchar_t user[128]={0}, pass[128]={0}, adapter[256]={0};
             BOOL install_present = FALSE, install_requested = FALSE;
             char nu[256]={0};
@@ -696,6 +698,7 @@ static int handle_request(PHTTP_REQUEST req)
             json_get_string(body, L"osType", os, 32);
             json_get_string(body, L"imagePath", img, MAX_PATH);
             json_get_string(body, L"diskPath", disk, MAX_PATH);
+            json_get_string(body, L"dataDiskPath", data_disk, MAX_PATH);
             json_get_string(body, L"templateName", tpl, 256);
             json_get_string(body, L"adminUser", user, 128);
             json_get_string(body, L"adminPass", pass, 128);
@@ -723,6 +726,16 @@ static int handle_request(PHTTP_REQUEST req)
                          "diskPath requires install=false");
                 return 0;
             }
+            if (data_disk[0] && cfg.is_template) {
+                send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                         "dataDiskPath is not supported for template creation");
+                return 0;
+            }
+            if (data_disk[0] && disk[0] && _wcsicmp(data_disk, disk) == 0) {
+                send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                         "dataDiskPath must differ from diskPath");
+                return 0;
+            }
             if (cfg.ssh_deploy_key && !cfg.ssh_enabled) {
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                          "sshDeployKey requires sshEnabled");
@@ -736,7 +749,9 @@ static int handle_request(PHTTP_REQUEST req)
             }
             WideCharToMultiByte(CP_UTF8,0,name,-1,nu,sizeof(nu),NULL,NULL);
             {
-                HRESULT hr = asb_vm_create(&cfg);
+                HRESULT hr = data_disk[0]
+                    ? asb_vm_create_with_data_disk(&cfg, data_disk)
+                    : asb_vm_create(&cfg);
                 SecureZeroMemory(pass, sizeof(pass));
                 /* create is async + auto-starts; success/failure also via events/alerts */
                 send_hr(req->RequestId, "createVm", nu, hr);

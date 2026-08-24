@@ -110,13 +110,15 @@ class Client:
 
     def create(self, **cfg):
         """Create a VM. Config keys: name, osType,
-        imagePath|templateName|diskPath, install, ramMb, hddGb, cpuCores,
+        imagePath|templateName|diskPath, dataDiskPath, install, ramMb, hddGb, cpuCores,
         gpuMode(0-2), networkMode(0-3), netAdapter, adminUser,
         adminPass, testMode, sshEnabled, sshDeployKey, isTemplate. sshDeployKey
         (requires sshEnabled) deploys the AppSandbox public key so you can SSH in
         with key auth (see key_path()); sshInfo reports keyDeployed + sshState 4
         once it lands. diskPath is a prebuilt Linux VHDX and requires
-        install=False. The daemon validates these exactly like the GUI; ramMb is
+        install=False. dataDiskPath optionally attaches one caller-owned secondary
+        VHDX without copying, formatting, snapshotting, or deleting it. The daemon
+        validates these exactly like the GUI; ramMb is
         rounded down to even here (2 MB-aligned, an HCS requirement, like the GUI).
         Async + auto-starts; watch status/events."""
         if isinstance(cfg.get("ramMb"), int):

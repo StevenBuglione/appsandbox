@@ -887,12 +887,14 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                        wchar_t *json_out, size_t json_out_chars)
 {
     wchar_t vhdx_esc[MAX_PATH * 2];
+    wchar_t data_disk_esc[MAX_PATH * 2];
     wchar_t iso_esc[MAX_PATH * 2];
     wchar_t res_esc[MAX_PATH * 2];
     wchar_t vmgs_esc[MAX_PATH * 2];
     wchar_t vmrs_esc[MAX_PATH * 2];
     wchar_t iso_section[512];
     wchar_t res_section[512];
+    wchar_t data_disk_section[1024];
     wchar_t net_section[512];
     wchar_t secureboot_section[512];
     wchar_t nested_section[128];
@@ -930,6 +932,15 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         escape_json_path(config->resources_iso_path, res_esc, MAX_PATH * 2);
         swprintf_s(res_section, 512,
             L",\"2\":{\"Type\":\"Iso\",\"Path\":\"%s\"}", res_esc);
+    }
+
+    /* Optional caller-owned secondary VHDX at the fixed data-disk slot. */
+    data_disk_section[0] = L'\0';
+    if (config->data_disk_path[0] != L'\0') {
+        escape_json_path(config->data_disk_path, data_disk_esc, MAX_PATH * 2);
+        swprintf_s(data_disk_section, 1024,
+            L",\"3\":{\"Type\":\"VirtualDisk\",\"Path\":\"%s\"}",
+            data_disk_esc);
     }
 
     /* Network adapter — skip for template VMs (no network during template creation) */
@@ -1167,6 +1178,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                             L"\"0\":{\"Type\":\"VirtualDisk\",\"Path\":\"%s\"}"
                             L"%s"
                             L"%s"
+                            L"%s"
                         L"}"
                     L"}"
                 L"},"
@@ -1192,6 +1204,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         vhdx_esc,
         iso_section,
         res_section,
+        data_disk_section,
         video_section,
         comports_section,
         service_table,
@@ -1201,6 +1214,62 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         guest_state_section);
 
     return written > 0;
+}
+
+static HRESULT prepare_secondary_data_disk(const VmConfig *config)
+{
+    DWORD attrs;
+    DWORD path_length;
+    HRESULT grant_hr;
+    const wchar_t *extension;
+    size_t vm_dir_length;
+    wchar_t full_path[MAX_PATH];
+    wchar_t vm_dir[MAX_PATH];
+
+    if (config->data_disk_path[0] == L'\0')
+        return S_OK;
+    path_length = GetFullPathNameW(config->data_disk_path, MAX_PATH, full_path, NULL);
+    attrs = GetFileAttributesW(config->data_disk_path);
+    extension = wcsrchr(config->data_disk_path, L'.');
+    if (path_length == 0 || path_length >= MAX_PATH ||
+        _wcsicmp(full_path, config->data_disk_path) != 0 ||
+        attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) ||
+        (attrs & FILE_ATTRIBUTE_REPARSE_POINT) ||
+        !extension || _wcsicmp(extension, L".vhdx") != 0 ||
+        _wcsicmp(config->data_disk_path, config->vhdx_path) == 0) {
+        ui_log(L"Error: Secondary data disk path is invalid or unsafe.");
+        return E_INVALIDARG;
+    }
+    wcscpy_s(vm_dir, MAX_PATH, config->vhdx_path);
+    {
+        wchar_t *last_slash = wcsrchr(vm_dir, L'\\');
+        if (!last_slash) {
+            ui_log(L"Error: Boot disk path has no owned VM directory.");
+            return E_INVALIDARG;
+        }
+        *last_slash = L'\0';
+    }
+    vm_dir_length = wcslen(vm_dir);
+    if (_wcsnicmp(config->data_disk_path, vm_dir, vm_dir_length) == 0 &&
+        (config->data_disk_path[vm_dir_length] == L'\\' ||
+         config->data_disk_path[vm_dir_length] == L'\0')) {
+        ui_log(L"Error: Secondary data disk must remain outside the owned VM directory.");
+        return E_INVALIDARG;
+    }
+    if (!wait_for_file_available(config->data_disk_path, 3000)) {
+        ui_log(L"Error: Secondary data disk is already locked by another owner.");
+        return HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION);
+    }
+    if (!pfnGrantAccess) {
+        ui_log(L"Error: HcsGrantVmAccess is unavailable for the secondary data disk.");
+        return E_NOTIMPL;
+    }
+    grant_hr = pfnGrantAccess(config->name, config->data_disk_path);
+    if (FAILED(grant_hr)) {
+        ui_log(L"Error: GrantVmAccess failed on the secondary data disk (0x%08X).", grant_hr);
+        return grant_hr;
+    }
+    return S_OK;
 }
 
 HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
@@ -1217,6 +1286,9 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
         ui_log(L"Error: VHDX file is still locked. Reboot or kill vmwp.exe in Task Manager.");
         return HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION);
     }
+    hr = prepare_secondary_data_disk(config);
+    if (FAILED(hr))
+        return hr;
 
     /* Grant VM access to VHDX and ISO files (required by vmwp.exe).
        After reboot, stale HcsGrantVmAccess ACLs may persist on reused files —
@@ -1275,6 +1347,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
         wcscpy_s(instance->name, 256, config->name);
         wcscpy_s(instance->os_type, 32, config->os_type);
         wcscpy_s(instance->vhdx_path, MAX_PATH, config->vhdx_path);
+        wcscpy_s(instance->data_disk_path, MAX_PATH, config->data_disk_path);
         wcscpy_s(instance->image_path, MAX_PATH, config->image_path);
         instance->ram_mb = config->ram_mb;
         instance->hdd_gb = config->hdd_gb;
@@ -1310,6 +1383,9 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
         ui_log(L"Error: VHDX file is still locked. Reboot or kill vmwp.exe in Task Manager.");
         return HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION);
     }
+    hr = prepare_secondary_data_disk(config);
+    if (FAILED(hr))
+        return hr;
 
     /* Grant VM access to VHDX and ISO files (required by vmwp.exe).
        After reboot, stale HcsGrantVmAccess ACLs may persist on reused files —
@@ -1367,6 +1443,7 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
         wcscpy_s(instance->name, 256, config->name);
         wcscpy_s(instance->os_type, 32, config->os_type);
         wcscpy_s(instance->vhdx_path, MAX_PATH, config->vhdx_path);
+        wcscpy_s(instance->data_disk_path, MAX_PATH, config->data_disk_path);
         wcscpy_s(instance->image_path, MAX_PATH, config->image_path);
         instance->ram_mb = config->ram_mb;
         instance->hdd_gb = config->hdd_gb;

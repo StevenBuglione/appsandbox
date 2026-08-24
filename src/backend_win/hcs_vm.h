@@ -34,6 +34,7 @@ typedef struct {
     wchar_t os_type[32];          /* L"Windows" or L"Linux" */
     wchar_t image_path[MAX_PATH]; /* ISO path */
     wchar_t vhdx_path[MAX_PATH];  /* will be created if doesn't exist */
+    wchar_t data_disk_path[MAX_PATH]; /* optional caller-owned secondary VHDX */
     DWORD   ram_mb;
     DWORD   hdd_gb;
     DWORD   cpu_cores;
@@ -62,6 +63,7 @@ typedef struct {
     wchar_t     name[256];
     wchar_t     os_type[32];
     wchar_t     vhdx_path[MAX_PATH];
+    wchar_t     data_disk_path[MAX_PATH];
     wchar_t     image_path[MAX_PATH];
     DWORD       ram_mb;
     DWORD       hdd_gb;

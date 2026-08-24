@@ -484,6 +484,8 @@ static void save_vm_list(void)
         fwprintf(f, L"OsType=%s\n", g_vms[i].os_type);
         fwprintf(f, L"ImagePath=%s\n", g_vms[i].image_path);
         fwprintf(f, L"VhdxPath=%s\n", g_vms[i].vhdx_path);
+        if (g_vms[i].data_disk_path[0] != L'\0')
+            fwprintf(f, L"DataDiskPath=%s\n", g_vms[i].data_disk_path);
         fwprintf(f, L"RamMB=%lu\n", g_vms[i].ram_mb);
         fwprintf(f, L"HddGB=%lu\n", g_vms[i].hdd_gb);
         fwprintf(f, L"CpuCores=%lu\n", g_vms[i].cpu_cores);
@@ -570,6 +572,8 @@ static void load_vm_list(void)
             wcscpy_s(vm->image_path, MAX_PATH, line + 10);
         else if (wcsncmp(line, L"VhdxPath=", 9) == 0)
             wcscpy_s(vm->vhdx_path, MAX_PATH, line + 9);
+        else if (wcsncmp(line, L"DataDiskPath=", 13) == 0)
+            wcscpy_s(vm->data_disk_path, MAX_PATH, line + 13);
         else if (wcsncmp(line, L"RamMB=", 6) == 0)
             vm->ram_mb = (DWORD)_wtoi(line + 6);
         else if (wcsncmp(line, L"HddGB=", 6) == 0)
@@ -2740,7 +2744,8 @@ ASB_API void asb_detach(void)
 
 /* ---- VM Create ---- */
 
-ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
+static HRESULT asb_vm_create_internal(const AsbVmConfig *config,
+                                      const wchar_t *data_disk_input)
 {
     VmConfig cfg;
     VmInstance *inst;
@@ -2754,6 +2759,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     BOOL from_template = FALSE;
     BOOL from_prebuilt_disk = FALSE;
     wchar_t prebuilt_disk_path[MAX_PATH] = { 0 };
+    wchar_t data_disk_path[MAX_PATH] = { 0 };
 
     if (!config || !config->name || config->name[0] == L'\0') {
         asb_log(L"Error: VM name is required.");
@@ -2784,6 +2790,29 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         }
         from_prebuilt_disk = TRUE;
     }
+    if (data_disk_input && data_disk_input[0] != L'\0') {
+        DWORD attrs;
+        DWORD path_length;
+        const wchar_t *extension;
+        path_length = GetFullPathNameW(data_disk_input, MAX_PATH, data_disk_path, NULL);
+        if (path_length == 0 || path_length >= MAX_PATH) {
+            asb_log(L"Error: Invalid secondary data disk path.");
+            return E_INVALIDARG;
+        }
+        attrs = GetFileAttributesW(data_disk_path);
+        extension = wcsrchr(data_disk_path, L'.');
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) ||
+            (attrs & FILE_ATTRIBUTE_REPARSE_POINT) ||
+            !extension || _wcsicmp(extension, L".vhdx") != 0) {
+            asb_log(L"Error: Secondary data disk must be an existing non-reparse .vhdx file.");
+            return E_INVALIDARG;
+        }
+        if (from_prebuilt_disk && _wcsicmp(data_disk_path, prebuilt_disk_path) == 0) {
+            asb_log(L"Error: Secondary data disk must differ from the prebuilt boot disk.");
+            return E_INVALIDARG;
+        }
+        wcscpy_s(cfg.data_disk_path, MAX_PATH, data_disk_path);
+    }
     if (config->username) wcscpy_s(cfg.admin_user, 128, config->username);
     if (config->password) wcscpy_s(cfg.admin_pass, 128, config->password);
     cfg.ram_mb = config->ram_mb;
@@ -2802,6 +2831,11 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     }
     is_template_create = config->is_template;
     cfg.is_template = is_template_create;
+
+    if (is_template_create && cfg.data_disk_path[0] != L'\0') {
+        asb_log(L"Error: Secondary data disks are not supported for template creation.");
+        return E_INVALIDARG;
+    }
 
     /* Defaults */
     if (cfg.hdd_gb == 0) cfg.hdd_gb = 64;
@@ -2927,6 +2961,16 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     }
     CreateDirectoryW(vhdx_dir, NULL);
     swprintf_s(cfg.vhdx_path, MAX_PATH, L"%s\\disk.vhdx", vhdx_dir);
+    if (cfg.data_disk_path[0] != L'\0') {
+        size_t vm_dir_length = wcslen(vhdx_dir);
+        if (_wcsicmp(cfg.data_disk_path, cfg.vhdx_path) == 0 ||
+            (_wcsnicmp(cfg.data_disk_path, vhdx_dir, vm_dir_length) == 0 &&
+             (cfg.data_disk_path[vm_dir_length] == L'\\' ||
+              cfg.data_disk_path[vm_dir_length] == L'\0'))) {
+            asb_log(L"Error: Caller-owned secondary data disk must be outside the VM directory.");
+            return E_INVALIDARG;
+        }
+    }
 
     /* GPU driver shares */
     if ((cfg.gpu_mode == GPU_DEFAULT || cfg.gpu_mode == GPU_MIRROR) && !is_template_create) {
@@ -2955,6 +2999,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             wcscpy_s(inst->name, 256, cfg.name);
             wcscpy_s(inst->os_type, 32, cfg.os_type);
             wcscpy_s(inst->vhdx_path, MAX_PATH, cfg.vhdx_path);
+            wcscpy_s(inst->data_disk_path, MAX_PATH, cfg.data_disk_path);
             wcscpy_s(inst->image_path, MAX_PATH, cfg.image_path);
             inst->ram_mb = cfg.ram_mb;
             inst->hdd_gb = cfg.hdd_gb;
@@ -3022,6 +3067,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             wcscpy_s(inst->name, 256, cfg.name);
             wcscpy_s(inst->os_type, 32, cfg.os_type);
             wcscpy_s(inst->vhdx_path, MAX_PATH, cfg.vhdx_path);
+            wcscpy_s(inst->data_disk_path, MAX_PATH, cfg.data_disk_path);
             /* image_path isn't used by Linux but copy it through anyway so
                vms.cfg round-trips cleanly (UI sends it as the version tag). */
             wcscpy_s(inst->image_path, MAX_PATH, cfg.image_path);
@@ -3258,6 +3304,17 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     return S_OK;
 }
 
+ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
+{
+    return asb_vm_create_internal(config, NULL);
+}
+
+ASB_API HRESULT asb_vm_create_with_data_disk(const AsbVmConfig *config,
+                                              const wchar_t *data_disk_path)
+{
+    return asb_vm_create_internal(config, data_disk_path);
+}
+
 /* ---- VM Start ---- */
 
 ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
@@ -3308,6 +3365,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         wcscpy_s(args->config.os_type, 32, inst->os_type);
         wcscpy_s(args->config.image_path, MAX_PATH, inst->image_path);
         wcscpy_s(args->config.vhdx_path, MAX_PATH, inst->vhdx_path);
+        wcscpy_s(args->config.data_disk_path, MAX_PATH, inst->data_disk_path);
         args->config.ram_mb = inst->ram_mb;
         args->config.hdd_gb = inst->hdd_gb;
         args->config.cpu_cores = inst->cpu_cores;
