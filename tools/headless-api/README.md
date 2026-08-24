@@ -283,6 +283,16 @@ c.end_display_resize("dev")          # fixed backing: native resize only; legacy
 c.close_display("dev")              # or the user just closes it with the [X]
 ```
 
+Application windows accept a bounded native-presentation contract. The default
+`titleBarLayout="compact"` hosts a Windows App SDK title bar in the same HWND as
+the VM swap chain. `titleBarSidebarToggle` and `titleBarNavigation` accept
+`"visible"|"hidden"`; `titleBarMenu` accepts `"desktop"|"hidden"`. Use
+`titleBarLayout="caption-only"` for the ordinary Windows caption. Status reports
+the actual `contentWidth`, `contentHeight`, `titleBarHosted`, and
+`titleBarHeight`, so callers can verify the presentation without HWND access.
+The requested width and height always describe browser content; the native
+title-bar inset is accounted for internally.
+
 - **`ready` gates the open.** On **Windows/Linux** it is `running && agentOnline &&
   idd_ready`, where `idd_ready` is the **guest agent's own report** that the display
   driver is up (`idd_status:ok`) — a latched flag, **not** a probe: reading it touches no

@@ -15,8 +15,12 @@ typedef struct AsbDisplayRuntimeState {
     UINT64 guest_frame_sequence;
     UINT render_width;
     UINT render_height;
+    UINT content_width;
+    UINT content_height;
     UINT frame_width;
     UINT frame_height;
+    BOOL title_bar_hosted;
+    UINT title_bar_height;
     BOOL startup_visible;
     BOOL startup_detailed;
     AsbStartupPhase startup_phase;

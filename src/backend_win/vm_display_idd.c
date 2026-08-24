@@ -35,6 +35,7 @@
 #include <stdarg.h>
 
 #include "vm_display_idd.h"
+#include "vm_native_titlebar.h"
 #include "vm_clipboard.h"
 #include "vm_agent.h"
 #include "hcs_vm.h"
@@ -112,6 +113,7 @@ typedef struct AudioFrameHeader {
 #define MIN_FRAME_HEIGHT    64
 #define MAX_FRAME_WIDTH     7680
 #define MAX_FRAME_HEIGHT    4320
+#define MAX_RENDER_HEIGHT   (MAX_FRAME_HEIGHT + 256)
 #define MAX_FRAME_STRIDE    (MAX_FRAME_WIDTH * 4)
 #define MAX_DIRTY_RECTS     64
 
@@ -150,6 +152,7 @@ typedef struct InputPacket {
 #define WM_IDD_RESIZE           (WM_USER + 102)
 #define WM_IDD_RESIZE_PHASE     (WM_USER + 103)
 #define WM_IDD_STARTUP_TASKBAR  (WM_USER + 104)
+#define WM_IDD_TITLEBAR_ACTION  (WM_USER + 105)
 
 #define IDT_RESIZE_DEBOUNCE 2002
 #define RESIZE_DEBOUNCE_MS  33
@@ -249,6 +252,8 @@ struct VmDisplayIdd {
     BOOL         show_on_open;
     HICON        custom_icon;
     AsbWindowChromeOptions window_chrome;
+    VmNativeTitleBar *native_title_bar;
+    UINT         title_bar_height;
 
     /* Host-owned startup presentation. It is rendered by the same D3D worker
        and swap chain as the guest, so the first visible client pixel is never
@@ -612,6 +617,53 @@ static void idd_set_window_app_id(HWND hwnd, const wchar_t *app_id)
     store->lpVtbl->Release(store);
 }
 
+static BOOL idd_get_content_size(VmDisplayIdd *d, HWND hwnd,
+                                 UINT *width, UINT *height)
+{
+    RECT client;
+    LONG content_height;
+
+    if (!d || !hwnd || !width || !height || !GetClientRect(hwnd, &client))
+        return FALSE;
+    content_height = client.bottom - client.top - (LONG)d->title_bar_height;
+    if (client.right <= client.left || content_height <= 0)
+        return FALSE;
+    *width = (UINT)(client.right - client.left);
+    *height = (UINT)content_height;
+    return TRUE;
+}
+
+static BOOL idd_resize_window_for_content(VmDisplayIdd *d,
+                                          UINT width,
+                                          UINT height,
+                                          UINT flags)
+{
+    RECT window_rect;
+    RECT client_rect;
+    UINT current_width;
+    UINT current_height;
+    UINT verified_width;
+    UINT verified_height;
+    int outer_width;
+    int outer_height;
+
+    if (!d || !d->hwnd || !GetWindowRect(d->hwnd, &window_rect) ||
+        !GetClientRect(d->hwnd, &client_rect) ||
+        !idd_get_content_size(d, d->hwnd, &current_width, &current_height))
+        return FALSE;
+
+    outer_width = window_rect.right - window_rect.left +
+                  (int)width - (int)current_width;
+    outer_height = window_rect.bottom - window_rect.top +
+                   (int)height - (int)current_height;
+    if (outer_width <= 0 || outer_height <= 0 ||
+        !SetWindowPos(d->hwnd, NULL, 0, 0, outer_width, outer_height,
+                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | flags) ||
+        !idd_get_content_size(d, d->hwnd, &verified_width, &verified_height))
+        return FALSE;
+    return verified_width == width && verified_height == height;
+}
+
 
 
 /* ---- Debug log panel ---- */
@@ -655,13 +707,13 @@ static BOOL idd_agent_send(VmDisplayIdd *d, const char *command,
 
 static void idd_update_desired_resize(VmDisplayIdd *d, HWND hwnd)
 {
-    RECT rc;
     UINT width, height;
     BOOL changed = FALSE;
 
-    if (!d || !hwnd || !GetClientRect(hwnd, &rc)) return;
-    width = d->fixed_backing ? d->backing_width : (UINT)rc.right;
-    height = d->fixed_backing ? d->backing_height : (UINT)rc.bottom;
+    if (!d || !hwnd || !idd_get_content_size(d, hwnd, &width, &height))
+        return;
+    width = d->fixed_backing ? d->backing_width : width;
+    height = d->fixed_backing ? d->backing_height : height;
     if (width < MIN_FRAME_WIDTH || height < MIN_FRAME_HEIGHT ||
         width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
         return;
@@ -687,7 +739,7 @@ static void idd_publish_render_size(VmDisplayIdd *d, HWND hwnd)
     width = rc.right - rc.left;
     height = rc.bottom - rc.top;
     if (width < MIN_FRAME_WIDTH || height < MIN_FRAME_HEIGHT ||
-        width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
+        width > MAX_FRAME_WIDTH || height > MAX_RENDER_HEIGHT)
         return;
 
     InterlockedExchange(&d->desired_render_width, width);
@@ -1159,7 +1211,8 @@ static void compute_letterbox(UINT client_w, UINT client_h,
 }
 
 /* Map window client coordinates to VM framebuffer coordinates */
-static void window_to_vm_coords(HWND hwnd, int wx, int wy, BOOL stretch,
+static void window_to_vm_coords(HWND hwnd, int wx, int wy, UINT top_inset,
+                                 BOOL stretch,
                                  BOOL crop,
                                  UINT vm_w, UINT vm_h,
                                  UINT *vx, UINT *vy)
@@ -1169,6 +1222,11 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy, BOOL stretch,
     float local_x, local_y;
 
     GetClientRect(hwnd, &rc);
+    if ((UINT)rc.bottom > top_inset)
+        rc.bottom -= (LONG)top_inset;
+    else
+        rc.bottom = 0;
+    wy -= (int)top_inset;
     if (crop) {
         *vx = wx < 0 ? 0 : (UINT)wx;
         *vy = wy < 0 ? 0 : (UINT)wy;
@@ -1629,7 +1687,11 @@ static BOOL d3d_update_startup_texture(VmDisplayIdd *d)
     if (phase == ASB_STARTUP_READY)
         phase = ASB_STARTUP_FINISHING;
     if (!vm_startup_scene_render(
-            d->startup_scene, d->render_width, d->render_height,
+            d->startup_scene,
+            d->render_width,
+            d->render_height > d->title_bar_height
+                ? d->render_height - d->title_bar_height
+                : d->render_height,
             d->hwnd ? GetDpiForWindow(d->hwnd) : 96,
             phase,
             InterlockedCompareExchange(&d->startup_detailed, 0, 0) != 0,
@@ -1721,7 +1783,7 @@ static BOOL d3d_init(VmDisplayIdd *d)
             &d->desired_render_height, 0, 0);
     if (initial_width < MIN_FRAME_WIDTH || initial_width > MAX_FRAME_WIDTH)
         initial_width = d->initial_width;
-    if (initial_height < MIN_FRAME_HEIGHT || initial_height > MAX_FRAME_HEIGHT)
+    if (initial_height < MIN_FRAME_HEIGHT || initial_height > MAX_RENDER_HEIGHT)
         initial_height = d->initial_height;
 
     /* Create a two-buffer flip-model chain. App-mode targets the top-level
@@ -1872,7 +1934,7 @@ static BOOL d3d_resize_swap_chain(VmDisplayIdd *d, UINT width, UINT height)
 
     if (!d->swap_chain) return FALSE;
     if (width < MIN_FRAME_WIDTH || height < MIN_FRAME_HEIGHT ||
-        width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
+        width > MAX_FRAME_WIDTH || height > MAX_RENDER_HEIGHT)
         return FALSE;
     if (d->render_width == width && d->render_height == height && d->rtv)
         return TRUE;
@@ -1911,12 +1973,27 @@ static BOOL d3d_render_frame(VmDisplayIdd *d)
     D3D11_VIEWPORT vp;
     ID3D11ShaderResourceView *display_srv;
     HRESULT hr;
-    float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    COLORREF surface_color;
+    float clear_color[4];
     BOOL frame_uploaded = FALSE;
     BOOL startup_active;
 
     if (!d->device || !d->ctx || !d->swap_chain || !d->rtv)
         return FALSE;
+
+    /* The swap chain also owns the pixels underneath the XAML Island and any
+       area exposed for a frame while Windows is resizing. Match that surface
+       to the native title bar so a delayed island/layout update can never
+       reveal a black seam. */
+    surface_color = d->window_chrome.has_caption_color
+                        ? d->window_chrome.caption_color
+                        : (d->window_chrome.theme == ASB_TITLE_BAR_LIGHT
+                               ? RGB(243, 243, 243)
+                               : RGB(16, 18, 23));
+    clear_color[0] = (float)GetRValue(surface_color) / 255.0f;
+    clear_color[1] = (float)GetGValue(surface_color) / 255.0f;
+    clear_color[2] = (float)GetBValue(surface_color) / 255.0f;
+    clear_color[3] = 1.0f;
 
     /* Upload frame data to GPU texture if dirty */
     if (d->frame_dirty) {
@@ -1970,21 +2047,29 @@ static BOOL d3d_render_frame(VmDisplayIdd *d)
        startup surface follows that same qualified viewport policy. */
     {
         float vp_x, vp_y, vp_w, vp_h;
-        if (d->app_mode && d->fixed_backing) {
+        UINT content_height = d->render_height > d->title_bar_height
+                                  ? d->render_height - d->title_bar_height
+                                  : d->render_height;
+        if (startup_active && d->app_mode) {
+            vp_x = 0;
+            vp_y = (float)d->title_bar_height;
+            vp_w = (float)d->render_width;
+            vp_h = (float)content_height;
+        } else if (d->app_mode && d->fixed_backing) {
             /* The guest framebuffer is a fixed-capacity canvas. Rendering its
                native-sized viewport and letting the render target clip the
                right/bottom remainder preserves 1:1 text and video pixels while
                the product window changes size. The scene controller resizes
                Firefox logically inside that canvas. */
             vp_x = 0;
-            vp_y = 0;
+            vp_y = (float)d->title_bar_height;
             vp_w = (float)d->frame_width;
             vp_h = (float)d->frame_height;
         } else if (d->app_mode) {
             vp_x = 0;
-            vp_y = 0;
+            vp_y = (float)d->title_bar_height;
             vp_w = (float)d->render_width;
-            vp_h = (float)d->render_height;
+            vp_h = (float)content_height;
         } else {
             compute_letterbox(d->render_width, d->render_height,
                               d->frame_width, d->frame_height,
@@ -2764,8 +2849,11 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     wchar_t title[300];
     MSG msg;
     BOOL com_initialized = FALSE;
+    HRESULT com_result;
 
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    com_result = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    com_initialized = SUCCEEDED(com_result);
     ensure_idd_class(d->hInstance);
 
     if (d->app_mode)
@@ -2792,6 +2880,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     if (!d->hwnd) {
         ui_log(L"IDD: CreateWindowEx failed (0x%08X)", GetLastError());
         d->open = FALSE;
+        if (com_initialized)
+            CoUninitialize();
         return 1;
     }
 
@@ -2809,6 +2899,42 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
        tint documented DWM attributes without replacing native Snap, resize,
        system-menu, keyboard, or accessibility behavior. */
     vm_window_chrome_apply(d->hwnd, &d->window_chrome, TRUE);
+
+    if (d->app_mode &&
+        d->window_chrome.layout == ASB_TITLE_BAR_COMPACT) {
+        if (!com_initialized) {
+            ui_log(L"IDD: compact title bar requires an STA window thread.");
+            DestroyWindow(d->hwnd);
+            d->hwnd = NULL;
+            d->open = FALSE;
+            return 1;
+        }
+        d->native_title_bar = vm_native_titlebar_create(
+            d->hwnd,
+            &d->window_chrome,
+            WM_IDD_TITLEBAR_ACTION);
+        if (!d->native_title_bar) {
+            ui_log(L"IDD: failed to host the compact WinUI title bar.");
+            DestroyWindow(d->hwnd);
+            d->hwnd = NULL;
+            d->open = FALSE;
+            CoUninitialize();
+            return 1;
+        }
+        d->title_bar_height = vm_native_titlebar_height(d->native_title_bar);
+        if (!idd_resize_window_for_content(
+                d, d->initial_width, d->initial_height, 0)) {
+            ui_log(L"IDD: failed to preserve the requested content size after title-bar attachment.");
+            vm_native_titlebar_destroy(d->native_title_bar);
+            d->native_title_bar = NULL;
+            d->title_bar_height = 0;
+            DestroyWindow(d->hwnd);
+            d->hwnd = NULL;
+            d->open = FALSE;
+            CoUninitialize();
+            return 1;
+        }
+    }
 
     /* VM/debug controls never appear on an application-mode window. */
     if (!d->app_mode) {
@@ -2844,6 +2970,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         DestroyWindow(d->hwnd);
         d->hwnd = NULL;
         d->open = FALSE;
+        if (com_initialized)
+            CoUninitialize();
         return 1;
     }
     idd_publish_render_size(d, d->hwnd);
@@ -2905,6 +3033,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         DestroyWindow(d->hwnd);
         d->hwnd = NULL;
         d->open = FALSE;
+        if (com_initialized)
+            CoUninitialize();
         return 1;
     }
 
@@ -2920,6 +3050,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         DestroyWindow(d->hwnd);
         d->hwnd = NULL;
         d->open = FALSE;
+        if (com_initialized)
+            CoUninitialize();
         return 1;
     }
 
@@ -2944,8 +3076,6 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         SetForegroundWindow(d->hwnd);
     }
     if (d->startup_enabled) {
-        HRESULT com_result = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-        com_initialized = SUCCEEDED(com_result);
         if (com_initialized &&
             SUCCEEDED(CoCreateInstance(
                 &CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER,
@@ -2966,6 +3096,9 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     /* Message pump */
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        if (vm_native_titlebar_pretranslate_message(
+                d->native_title_bar, &msg))
+            continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -2973,6 +3106,11 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     if (d->taskbar) {
         d->taskbar->lpVtbl->Release(d->taskbar);
         d->taskbar = NULL;
+    }
+    if (d->native_title_bar) {
+        vm_native_titlebar_destroy(d->native_title_bar);
+        d->native_title_bar = NULL;
+        d->title_bar_height = 0;
     }
     if (com_initialized)
         CoUninitialize();
@@ -3120,6 +3258,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 DestroyIcon(d->custom_icon);
                 d->custom_icon = NULL;
             }
+            if (d->native_title_bar) {
+                vm_native_titlebar_destroy(d->native_title_bar);
+                d->native_title_bar = NULL;
+                d->title_bar_height = 0;
+            }
 
             /* Notify main UI only if user closed the window */
             if (user_initiated && d->main_hwnd && d->vm)
@@ -3133,6 +3276,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) {
+            if (d->native_title_bar) {
+                vm_native_titlebar_destroy(d->native_title_bar);
+                d->native_title_bar = NULL;
+                d->title_bar_height = 0;
+            }
             /* Application mode aliases render_hwnd to the top-level HWND. Do
                not leave a destroyed HWND behind for late cursor/focus guards. */
             if (d->render_hwnd == hwnd)
@@ -3145,28 +3293,35 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_GETMINMAXINFO:
     {
         MINMAXINFO *mmi = (MINMAXINFO *)lp;
-        DWORD style   = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
-        DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
-        UINT dpi = GetDpiForWindow(hwnd);
-        RECT wr;
-        wr.left = 0; wr.top = 0;
-        wr.right = d ? (LONG)d->minimum_width : 320;
-        wr.bottom = d ? (LONG)d->minimum_height : 180;
-        AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, dpi);
-        mmi->ptMinTrackSize.x = wr.right - wr.left;
-        mmi->ptMinTrackSize.y = wr.bottom - wr.top;
+        RECT window_rect;
+        RECT client_rect;
+        LONG non_client_width = 0;
+        LONG non_client_height = 0;
+        if (GetWindowRect(hwnd, &window_rect) &&
+            GetClientRect(hwnd, &client_rect)) {
+            non_client_width = window_rect.right - window_rect.left -
+                               (client_rect.right - client_rect.left);
+            non_client_height = window_rect.bottom - window_rect.top -
+                                (client_rect.bottom - client_rect.top);
+        }
+        mmi->ptMinTrackSize.x =
+            (d ? (LONG)d->minimum_width : 320) + non_client_width;
+        mmi->ptMinTrackSize.y =
+            (d ? (LONG)d->minimum_height : 180) +
+            (d ? (LONG)d->title_bar_height : 0) + non_client_height;
 
         /* DefWindowProc seeds this with the monitor work-area limit. The
            virtual display supports larger client sizes, including a full
            2560x1440 client on a 2560x1440 host with decorations off-screen. */
-        wr.left = 0; wr.top = 0;
-        wr.right = d && d->fixed_backing
-                       ? (LONG)d->backing_width : MAX_FRAME_WIDTH;
-        wr.bottom = d && d->fixed_backing
-                        ? (LONG)d->backing_height : MAX_FRAME_HEIGHT;
-        AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, dpi);
-        mmi->ptMaxTrackSize.x = wr.right - wr.left;
-        mmi->ptMaxTrackSize.y = wr.bottom - wr.top;
+        mmi->ptMaxTrackSize.x =
+            (d && d->fixed_backing
+                 ? (LONG)d->backing_width
+                 : MAX_FRAME_WIDTH) + non_client_width;
+        mmi->ptMaxTrackSize.y =
+            (d && d->fixed_backing
+                 ? (LONG)d->backing_height
+                 : MAX_FRAME_HEIGHT) +
+            (d ? (LONG)d->title_bar_height : 0) + non_client_height;
         return 0;
     }
 
@@ -3180,6 +3335,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d && d->app_mode)
             vm_window_chrome_apply(hwnd, &d->window_chrome,
                                    GetActiveWindow() == hwnd);
+        if (d && d->native_title_bar) {
+            vm_native_titlebar_resize(d->native_title_bar);
+            d->title_bar_height =
+                vm_native_titlebar_height(d->native_title_bar);
+        }
         return 0;
     }
 
@@ -3189,6 +3349,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d && d->app_mode)
             vm_window_chrome_apply(hwnd, &d->window_chrome,
                                    GetActiveWindow() == hwnd);
+        if (d && d->native_title_bar)
+            vm_native_titlebar_refresh(d->native_title_bar);
         if (d && d->startup_scene)
             InterlockedExchange(&d->startup_settings_changed, 1);
         idd_request_render(d, FALSE);
@@ -3197,6 +3359,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SIZE:
         if (d) {
             RECT rc;
+            if (d->native_title_bar) {
+                vm_native_titlebar_resize(d->native_title_bar);
+                d->title_bar_height =
+                    vm_native_titlebar_height(d->native_title_bar);
+            }
             GetClientRect(hwnd, &rc);
             if (d->render_hwnd && d->render_hwnd != hwnd)
                 SetWindowPos(d->render_hwnd, NULL, 0, 0, rc.right, rc.bottom,
@@ -3257,6 +3424,15 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
 
+    case WM_IDD_TITLEBAR_ACTION:
+        if (d && wp == ASB_NATIVE_TITLE_BAR_TOGGLE_SIDEBAR) {
+            if (d->startup_scene)
+                vm_startup_scene_toggle_sidebar(d->startup_scene);
+            idd_request_render(d, FALSE);
+            return 1;
+        }
+        return 0;
+
     case WM_CLIPBOARDUPDATE:
         if (d && d->clipboard) {
             vm_clipboard_on_clipboard_update(d->clipboard);
@@ -3292,23 +3468,17 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             UINT width = (UINT)wp;
             UINT height = (UINT)lp;
-            DWORD style = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
-            DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
-            UINT dpi = GetDpiForWindow(hwnd);
-            RECT wr = { 0, 0, (LONG)width, (LONG)height };
-            RECT client;
+            UINT content_width;
+            UINT content_height;
             if (width < d->minimum_width || height < d->minimum_height ||
                 width > MAX_FRAME_WIDTH || height > MAX_FRAME_HEIGHT)
                 return 0;
             if (IsIconic(hwnd) || IsZoomed(hwnd))
                 ShowWindow(hwnd, SW_RESTORE);
-            if (!AdjustWindowRectExForDpi(&wr, style, FALSE, exstyle, dpi) ||
-                !SetWindowPos(hwnd, NULL, 0, 0,
-                              wr.right - wr.left, wr.bottom - wr.top,
-                              SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) ||
-                !GetClientRect(hwnd, &client) ||
-                client.right - client.left != (LONG)width ||
-                client.bottom - client.top != (LONG)height) {
+            if (!idd_resize_window_for_content(d, width, height, 0) ||
+                !idd_get_content_size(
+                    d, hwnd, &content_width, &content_height) ||
+                content_width != width || content_height != height) {
                 ui_log(L"IDD: owned display resize failed (Win32 %lu).",
                        GetLastError());
                 return 0;
@@ -3360,6 +3530,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->app_mode)
                 vm_window_chrome_apply(hwnd, &d->window_chrome,
                                        d->input_focused);
+            if (d->native_title_bar)
+                vm_native_titlebar_refresh(d->native_title_bar);
             if (!d->input_focused)
                 idd_flush_held_keys(d);
         }
@@ -3393,6 +3565,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 /* lp coords are relative to render child */
                 window_to_vm_coords(d->render_hwnd,
                                     (int)(short)LOWORD(lp), (int)(short)HIWORD(lp),
+                                    d->title_bar_height,
                                     d->app_mode && !d->fixed_backing,
                                     d->app_mode && d->fixed_backing,
                                     frame_width, frame_height, &vx, &vy);
@@ -3859,6 +4032,8 @@ BOOL vm_display_idd_set_startup_state(VmDisplayIdd *display,
 BOOL vm_display_idd_get_runtime_state(VmDisplayIdd *display,
                                       AsbDisplayRuntimeState *state)
 {
+    UINT content_width = 0;
+    UINT content_height = 0;
     if (!display || !state || !display->open || display->stop)
         return FALSE;
 
@@ -3875,6 +4050,13 @@ BOOL vm_display_idd_get_runtime_state(VmDisplayIdd *display,
             &display->presented_render_width, 0, 0);
     state->render_height = (UINT)InterlockedCompareExchange(
             &display->presented_render_height, 0, 0);
+    if (display->hwnd)
+        idd_get_content_size(
+            display, display->hwnd, &content_width, &content_height);
+    state->content_width = content_width;
+    state->content_height = content_height;
+    state->title_bar_hosted = display->native_title_bar != NULL;
+    state->title_bar_height = display->title_bar_height;
     state->startup_visible = InterlockedCompareExchange(
             &display->startup_visible, 0, 0) != 0;
     state->startup_detailed = InterlockedCompareExchange(

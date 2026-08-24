@@ -885,6 +885,10 @@ static int handle_request(PHTTP_REQUEST req)
                 wchar_t icon_path[MAX_PATH] = {0};
                 wchar_t title_bar_theme[16] = L"dark";
                 wchar_t title_bar_corner[24] = L"system";
+                wchar_t title_bar_layout[24] = L"compact";
+                wchar_t title_bar_sidebar[16] = L"visible";
+                wchar_t title_bar_navigation[16] = L"visible";
+                wchar_t title_bar_menu[16] = L"desktop";
                 wchar_t caption_color[16] = {0};
                 wchar_t caption_text_color[16] = {0};
                 wchar_t border_color[16] = {0};
@@ -929,12 +933,21 @@ static int handle_request(PHTTP_REQUEST req)
                 display_options.window_chrome.theme = ASB_TITLE_BAR_DARK;
                 display_options.window_chrome.corner_preference =
                     ASB_WINDOW_CORNER_SYSTEM;
+                display_options.window_chrome.layout =
+                    ASB_TITLE_BAR_COMPACT;
+                display_options.window_chrome.sidebar_toggle_visible = TRUE;
+                display_options.window_chrome.navigation_visible = TRUE;
+                display_options.window_chrome.desktop_menu_visible = TRUE;
 
                 json_get_string(body, L"title", title, 256);
                 json_get_string(body, L"appUserModelId", app_id, 256);
                 json_get_string(body, L"iconPath", icon_path, MAX_PATH);
                 json_get_string(body, L"titleBarTheme", title_bar_theme, 16);
                 json_get_string(body, L"titleBarCorner", title_bar_corner, 24);
+                json_get_string(body, L"titleBarLayout", title_bar_layout, 24);
+                json_get_string(body, L"titleBarSidebarToggle", title_bar_sidebar, 16);
+                json_get_string(body, L"titleBarNavigation", title_bar_navigation, 16);
+                json_get_string(body, L"titleBarMenu", title_bar_menu, 16);
                 json_get_string(body, L"captionColor", caption_color, 16);
                 json_get_string(body, L"captionTextColor", caption_text_color, 16);
                 json_get_string(body, L"borderColor", border_color, 16);
@@ -1025,6 +1038,44 @@ static int handle_request(PHTTP_REQUEST req)
                 } else {
                     send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                              "titleBarCorner is outside the supported set");
+                    return 0;
+                }
+                if (_wcsicmp(title_bar_layout, L"compact") == 0) {
+                    display_options.window_chrome.layout =
+                        ASB_TITLE_BAR_COMPACT;
+                } else if (_wcsicmp(title_bar_layout, L"caption-only") == 0) {
+                    display_options.window_chrome.layout =
+                        ASB_TITLE_BAR_CAPTION_ONLY;
+                } else {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "titleBarLayout must be 'compact' or 'caption-only'");
+                    return 0;
+                }
+                if (_wcsicmp(title_bar_sidebar, L"visible") == 0) {
+                    display_options.window_chrome.sidebar_toggle_visible = TRUE;
+                } else if (_wcsicmp(title_bar_sidebar, L"hidden") == 0) {
+                    display_options.window_chrome.sidebar_toggle_visible = FALSE;
+                } else {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "titleBarSidebarToggle must be 'visible' or 'hidden'");
+                    return 0;
+                }
+                if (_wcsicmp(title_bar_navigation, L"visible") == 0) {
+                    display_options.window_chrome.navigation_visible = TRUE;
+                } else if (_wcsicmp(title_bar_navigation, L"hidden") == 0) {
+                    display_options.window_chrome.navigation_visible = FALSE;
+                } else {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "titleBarNavigation must be 'visible' or 'hidden'");
+                    return 0;
+                }
+                if (_wcsicmp(title_bar_menu, L"desktop") == 0) {
+                    display_options.window_chrome.desktop_menu_visible = TRUE;
+                } else if (_wcsicmp(title_bar_menu, L"hidden") == 0) {
+                    display_options.window_chrome.desktop_menu_visible = FALSE;
+                } else {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "titleBarMenu must be 'desktop' or 'hidden'");
                     return 0;
                 }
                 if (caption_color[0]) {
@@ -1380,7 +1431,7 @@ static int handle_request(PHTTP_REQUEST req)
                    asb_vm_idd_ready: running + agent-online + the agent's latched
                    idd_status flag, so a client can poll this on an interval (it disturbs
                    nothing) and POST to open once ready. */
-                char b[768];
+                char b[1024];
                 DisplayEntry *e = display_find(v->unique_id);
                 BOOL open = e && e->disp && vm_display_idd_is_open(e->disp);
                 BOOL ready = open || asb_vm_idd_ready(vm);
@@ -1391,13 +1442,18 @@ static int handle_request(PHTTP_REQUEST req)
                               "\"receivedFrames\":%llu,\"presentedFrames\":%llu,"
                               "\"presentCount\":%llu,\"guestFrameSequence\":%llu,"
                               "\"renderWidth\":%u,\"renderHeight\":%u,"
+                              "\"contentWidth\":%u,\"contentHeight\":%u,"
                               "\"frameWidth\":%u,\"frameHeight\":%u,"
+                              "\"titleBarHosted\":%s,\"titleBarHeight\":%u,"
                               "\"startupVisible\":%s,\"startupDetailed\":%s,"
                               "\"startupPhase\":\"%s\"}",
                               state.received_frames, state.presented_frames,
                               state.present_count, state.guest_frame_sequence,
                               state.render_width, state.render_height,
+                              state.content_width, state.content_height,
                               state.frame_width, state.frame_height,
+                              state.title_bar_hosted ? "true" : "false",
+                              state.title_bar_height,
                               state.startup_visible ? "true" : "false",
                               state.startup_detailed ? "true" : "false",
                               startup_phase_name(state.startup_phase));

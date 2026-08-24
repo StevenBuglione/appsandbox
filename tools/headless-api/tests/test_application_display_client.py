@@ -325,6 +325,74 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("WindowsAppSDKSelfContained>false", project)
         self.assertIn("Microsoft.WindowsAppSDK.WinUI", project)
 
+    def test_compact_title_bar_is_wired_into_the_production_display(self):
+        root = Path(__file__).resolve().parents[3]
+        source = (root / "src" / "backend_win" / "vm_display_idd.c").read_text(
+            encoding="utf-8"
+        )
+        title_bar = (
+            root / "src" / "backend_win" / "vm_native_titlebar.cpp"
+        ).read_text(encoding="utf-8")
+        api = (root / "src" / "app_win" / "headless.c").read_text(
+            encoding="utf-8"
+        )
+        project = (root / "AppSandbox.vcxproj").read_text(encoding="utf-8")
+
+        self.assertIn("DesktopWindowXamlSource", title_bar)
+        self.assertIn("ExtendsContentIntoTitleBar(true)", title_bar)
+        self.assertIn("TitleBar create_title_bar", title_bar)
+        self.assertIn("ContentPreTranslateMessage", title_bar)
+        self.assertIn("SetDragRectangles", title_bar)
+        self.assertIn('L"SidebarToggleButton"', title_bar)
+        self.assertIn("PostMessageW(state->hwnd, WM_CLOSE", title_bar)
+
+        self.assertIn("vm_native_titlebar_create(", source)
+        self.assertIn("vm_native_titlebar_pretranslate_message(", source)
+        self.assertIn("vm_native_titlebar_resize(", source)
+        self.assertIn("idd_get_content_size", source)
+        self.assertIn("idd_resize_window_for_content", source)
+        self.assertIn("d->render_height - d->title_bar_height", source)
+        self.assertIn("wy -= (int)top_inset", source)
+        self.assertIn("RGB(16, 18, 23)", source)
+        self.assertIn("title_bar_hosted", source)
+
+        self.assertIn('json_get_string(body, L"titleBarLayout"', api)
+        self.assertIn('L"compact"', api)
+        self.assertIn('L"caption-only"', api)
+        self.assertIn('L"visible"', api)
+        self.assertIn('L"hidden"', api)
+        self.assertIn('L"desktop"', api)
+        self.assertIn(r'\"titleBarHosted\":%s', api)
+        self.assertIn(r'\"contentWidth\":%u', api)
+
+        self.assertIn("vm_native_titlebar.cpp", project)
+        self.assertIn("Microsoft.WindowsAppSDK.WinUI", project)
+        self.assertIn("<CompileAs>CompileAsCpp</CompileAs>", project)
+        self.assertIn("<WindowsPackageType>None</WindowsPackageType>", project)
+
+        # One production HWND owns the frame, swap chain, startup surface, and
+        # XAML Island. The integration must not regress to custom non-client
+        # emulation, a second top-level splash, or a timer-driven resize loop.
+        self.assertIn("d->render_hwnd = d->hwnd", source)
+        self.assertNotIn("WM_NCCALCSIZE", source)
+        self.assertNotIn("SetTimer(hwnd, IDT_PRESENT", source)
+
+    def test_title_bar_does_not_replace_the_qualified_resize_state_machine(self):
+        root = Path(__file__).resolve().parents[3]
+        source = (root / "src" / "backend_win" / "vm_display_idd.c").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("idd_render_thread_proc", source)
+        self.assertIn("DXGI_PRESENT_DO_NOT_WAIT", source)
+        self.assertIn("d->app_mode && d->fixed_backing", source)
+        self.assertIn("idd_begin_interactive_resize(d, hwnd)", source)
+        self.assertIn("idd_end_interactive_resize(d, hwnd)", source)
+        self.assertIn("idd_queue_desired_resize(d)", source)
+        self.assertIn("SWP_NOREDRAW", source)
+        self.assertIn("if (d->show_on_open)", source)
+        self.assertNotIn("IDT_PRESENT", source)
+
     def test_display_state_exposes_monotonic_native_presentation_progress(self):
         root = Path(__file__).resolve().parents[3]
         source = (root / "src" / "backend_win" / "vm_display_idd.c").read_text(

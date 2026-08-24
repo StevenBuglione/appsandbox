@@ -16,9 +16,18 @@ typedef enum AsbWindowCornerPreference {
     ASB_WINDOW_CORNER_ROUNDED_SMALL = 3
 } AsbWindowCornerPreference;
 
+typedef enum AsbTitleBarLayout {
+    ASB_TITLE_BAR_CAPTION_ONLY = 0,
+    ASB_TITLE_BAR_COMPACT = 1
+} AsbTitleBarLayout;
+
 typedef struct AsbWindowChromeOptions {
     AsbTitleBarTheme theme;
     AsbWindowCornerPreference corner_preference;
+    AsbTitleBarLayout layout;
+    BOOL sidebar_toggle_visible;
+    BOOL navigation_visible;
+    BOOL desktop_menu_visible;
     BOOL has_caption_color;
     BOOL has_text_color;
     BOOL has_border_color;
