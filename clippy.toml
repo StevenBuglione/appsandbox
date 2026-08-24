@@ -1,0 +1,11 @@
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-unwrap-in-tests = true
+check-private-items = true
+excessive-nesting-threshold = 3
+max-fn-params-bools = 0
+too-many-arguments-threshold = 5
+too-many-lines-threshold = 60
+type-complexity-threshold = 200
+warn-on-all-wildcard-imports = true

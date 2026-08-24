@@ -1,0 +1,11 @@
+[package]
+name = "asb-domain"
+description = "Pure AppSandbox domain invariants"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

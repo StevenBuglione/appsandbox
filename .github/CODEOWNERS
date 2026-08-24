@@ -1,0 +1,9 @@
+# Quality-governance changes require explicit review.
+/Cargo.toml @StevenBuglione
+/clippy.toml @StevenBuglione
+/deny.toml @StevenBuglione
+/.config/nextest.toml @StevenBuglione
+/quality.toml @StevenBuglione
+/rustfmt.toml @StevenBuglione
+/xtask/src/architecture.rs @StevenBuglione
+/.github/workflows/rust-quality.yml @StevenBuglione

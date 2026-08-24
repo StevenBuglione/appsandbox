@@ -1,0 +1,4 @@
+ping
+shutdown
+restart
+display_resize:1921x1081@60

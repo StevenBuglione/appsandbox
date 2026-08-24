@@ -432,7 +432,9 @@ FodyWeavers.xsd
 !/tools/win-mesa-gl/prebuilt/arm64/**
 
 # Local-only planning and notes — kept on disk for context, not pushed.
-/docs/
+/docs/*
+!/docs/rust-rewrite/
+!/docs/rust-rewrite/**
 
 # Local signing / Hardware-API submission secrets — never committed
 tools/sign/*.local.*
@@ -455,3 +457,6 @@ src/app_mac/xcconfig/LocalUser.xcconfig
 !/vendor/qemu-ivshmem/dist/bin/
 !/vendor/qemu-ivshmem/dist/bin/*
 mac-gpu/
+
+# Rust workspace output
+/target/

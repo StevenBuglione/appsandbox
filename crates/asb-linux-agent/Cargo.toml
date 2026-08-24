@@ -1,0 +1,11 @@
+[package]
+name = "asb-linux-agent"
+description = "Linux guest lifecycle and display-control agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

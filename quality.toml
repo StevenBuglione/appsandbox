@@ -1,0 +1,16 @@
+schema-version = 1
+protected-files = [
+    "Cargo.toml",
+    "clippy.toml",
+    "deny.toml",
+    ".config/nextest.toml",
+    "quality.toml",
+    "rustfmt.toml",
+    "xtask/src/architecture.rs",
+    ".github/workflows/rust-quality.yml",
+]
+architecture-rules = 14
+maximum-function-lines = 60
+maximum-function-arguments = 5
+maximum-nesting = 3
+coverage-minimum-lines = 0

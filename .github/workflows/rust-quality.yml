@@ -1,0 +1,27 @@
+name: Rust quality
+
+on:
+  pull_request:
+  push:
+    branches: [main, "codex/rust-rewrite"]
+
+permissions:
+  contents: read
+
+jobs:
+  ready:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install project toolchain
+        run: rustup show
+      - name: Install quality commands
+        run: |
+          cargo install --locked cargo-deny cargo-llvm-cov cargo-nextest
+          cargo install --locked --version 1.12.0 cargo-shear
+      - name: Authoritative quality gate
+        run: cargo xtask ready
