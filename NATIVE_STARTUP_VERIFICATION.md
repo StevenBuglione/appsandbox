@@ -3,16 +3,16 @@
 ## Scope
 
 This checkpoint adds a host-owned startup canvas, theme-matched Windows chrome,
-and a Windows App SDK qualification gate for compact framework controls in the
-existing native HWND. It does not create a splash window, render controls in
-the guest, or wait for the guest before showing useful pixels.
+and the qualified Windows App SDK compact framework controls to the production
+application-display HWND. It does not create a splash window, render controls
+in the guest, or wait for the guest before showing useful pixels.
 
 ## Automated verification
 
 - Release x64 `AppSandbox.exe` rebuild: passed.
 - Release x64 `NativeStartupPreview.exe` rebuild with level-four warnings and
   warnings-as-errors: passed.
-- Application display client and native architecture tests: 11 passed.
+- Application display client and native architecture tests: 13 passed.
 - Native Win32 + WinUI XAML Island title-bar build: passed.
 - Managed WinUI startup-experience build: passed with zero warnings.
 - Diff whitespace validation: passed.
@@ -71,11 +71,29 @@ Measured results:
 
 ## Integration boundary
 
-The active AppSandbox daemon is single-instance, so this isolated worktree did
-not replace it or take over the user's live VM. The production binary and exact
-shared painter/chrome modules were rebuilt. The Windows App SDK gate proves
-that the compact control strip can inhabit the same class of Win32 HWND and
-retain native caption behavior; it remains an isolated merge target until the
-AppHost integration deliberately replaces the running daemon. End-to-end VM
-first-frame and manual-ready handoff remain the final installed smoke test. No
-claim is made that the currently running daemon contains this checkpoint.
+The production Release x64 daemon was deliberately replaced by exact PID and
+smoked against `linguum-framework-m2`. The resulting single HWND contained the
+host-owned startup canvas and the compact WinUI title bar, with the genuine
+Windows minimize, maximize, close, frame, resize, shadow, and rounded corners.
+
+Production evidence:
+
+- `production-titlebar-final.png`: compact controls and Windows caption buttons
+  in the live VM application window.
+- API geometry: 1320x800 content, 36-pixel title bar, and 1320x836 render
+  surface on the initial sample.
+- 160 coalesced resize operations completed in 3.409 seconds; every API result
+  retained exact content geometry and the hosted title bar, and the final
+  render converged to 1355x995 for a 1355x959 content area.
+- Maximum resize-call latency was 35.122 ms. The daemon remained responsive;
+  working-set growth during the live sample was about 11.43 MiB.
+- Native maximize reached the 2560x1400 work area and restore returned to the
+  exact prior 1371x1003 outer bounds.
+- Closing the first native host returned success without terminating the
+  daemon. The production AppHost boundary is one WinUI `Application` per
+  process, matching Microsoft's island architecture; AppSandbox deliberately
+  prevents a second compact host in the same qualification daemon process.
+
+The private AppSandbox adapter is now sufficient for the M4.5 native-window
+smoke. Public BaseWindow mapping remains in the runtime repository and exposes
+no VM, transport, or HWND identifiers.

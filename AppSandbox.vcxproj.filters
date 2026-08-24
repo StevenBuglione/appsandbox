@@ -39,6 +39,9 @@
     <ClCompile Include="src\backend_win\vm_native_titlebar.cpp">
       <Filter>Backend Win</Filter>
     </ClCompile>
+    <ClCompile Include="src\backend_win\NativeTitleBarApp.xaml.cpp">
+      <Filter>Backend Win</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\app_win\resource.h">
@@ -80,5 +83,16 @@
     <ClInclude Include="src\backend_win\vm_native_titlebar.h">
       <Filter>Backend Win</Filter>
     </ClInclude>
+    <ClInclude Include="src\backend_win\NativeTitleBarApp.xaml.h">
+      <Filter>Backend Win</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ApplicationDefinition Include="src\backend_win\NativeTitleBarApp.xaml">
+      <Filter>Backend Win</Filter>
+    </ApplicationDefinition>
+    <Midl Include="src\backend_win\NativeTitleBarApp.idl">
+      <Filter>Backend Win</Filter>
+    </Midl>
   </ItemGroup>
 </Project>

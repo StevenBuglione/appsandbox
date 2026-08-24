@@ -25,6 +25,9 @@ VmNativeTitleBar *vm_native_titlebar_create(
     UINT action_message);
 
 void vm_native_titlebar_destroy(VmNativeTitleBar *title_bar);
+/* Detach the island while the parent HWND still exists. The remaining WinUI
+   thread objects are released after the owning message loop exits. */
+void vm_native_titlebar_close_island(VmNativeTitleBar *title_bar);
 void vm_native_titlebar_resize(VmNativeTitleBar *title_bar);
 void vm_native_titlebar_refresh(VmNativeTitleBar *title_bar);
 BOOL vm_native_titlebar_pretranslate_message(

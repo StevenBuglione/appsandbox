@@ -1,10 +1,12 @@
 #include "vm_native_titlebar.h"
+#include "NativeTitleBarApp.xaml.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #undef GetCurrentTime
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -41,6 +43,11 @@ namespace
 constexpr int title_bar_height_dip = 36;
 constexpr int button_width_dip = 32;
 constexpr int desktop_menu_width_dip = 156;
+/* A WinUI Application is a process singleton and is intentionally created
+   once for the lifetime of a native AppHost process. AppSandbox's daemon is
+   only the private qualification adapter; a second compact host must run in a
+   fresh process, matching the production one-AppHost-per-process boundary. */
+std::atomic<bool> native_app_runtime_consumed{false};
 
 Color color_from_ref(COLORREF value)
 {
@@ -102,7 +109,7 @@ struct VmNativeTitleBar
     bool sidebar_visible{true};
 
     DispatcherQueueController dispatcher{nullptr};
-    WindowsXamlManager xaml_manager{nullptr};
+    Application application{nullptr};
     DesktopWindowXamlSource source{nullptr};
     AppWindow app_window{nullptr};
     TitleBar title_bar{nullptr};
@@ -301,6 +308,8 @@ extern "C" VmNativeTitleBar *vm_native_titlebar_create(
 {
     if (!hwnd || !options || options->layout != ASB_TITLE_BAR_COMPACT)
         return nullptr;
+    if (native_app_runtime_consumed.exchange(true))
+        return nullptr;
 
     try {
         auto state = std::make_unique<VmNativeTitleBar>();
@@ -309,7 +318,11 @@ extern "C" VmNativeTitleBar *vm_native_titlebar_create(
         state->options = *options;
 
         state->dispatcher = DispatcherQueueController::CreateOnCurrentThread();
-        state->xaml_manager = WindowsXamlManager::InitializeForCurrentThread();
+        /* Standard WinUI controls require an Application object for metadata
+           and the XamlControlsResources declared in NativeTitleBarApp.xaml.
+           The isolated proof already exercised this exact startup order. */
+        state->application = make<
+            AppSandbox::implementation::NativeTitleBarApp>();
 
         auto window_id = GetWindowIdFromWindow(hwnd);
         state->app_window = AppWindow::GetFromWindowId(window_id);
@@ -334,19 +347,49 @@ extern "C" void vm_native_titlebar_destroy(VmNativeTitleBar *title_bar)
     if (!title_bar)
         return;
     try {
-        if (title_bar->app_window)
-            title_bar->app_window.TitleBar().ExtendsContentIntoTitleBar(false);
+        if (IsWindow(title_bar->hwnd)) {
+            vm_native_titlebar_close_island(title_bar);
+        } else {
+            /* Owner-window destruction already closed the site bridge. Calling
+               Content or Close on that invalidated projection is a use-after-
+               close inside the generated WinRT ABI. Drop references only. */
+            title_bar->menu_bar = nullptr;
+            title_bar->navigation = nullptr;
+            title_bar->title_bar = nullptr;
+            title_bar->source = nullptr;
+        }
+        if (title_bar->dispatcher)
+            title_bar->dispatcher.ShutdownQueue();
+        title_bar->app_window = nullptr;
+        title_bar->application = nullptr;
+    } catch (...) {
+    }
+    delete title_bar;
+}
+
+extern "C" void vm_native_titlebar_close_island(VmNativeTitleBar *title_bar)
+{
+    if (!title_bar)
+        return;
+    try {
+        /* The owner HWND is being destroyed immediately after this detach, so
+           do not transition AppWindow back to a system caption first. That
+           transition installs another non-client update while the island is
+           closing and its callback later races DestroyWindow. */
         if (title_bar->source) {
             title_bar->source.Content(nullptr);
             title_bar->source.Close();
         }
-        if (title_bar->xaml_manager)
-            title_bar->xaml_manager.Close();
-        if (title_bar->dispatcher)
-            title_bar->dispatcher.ShutdownQueue();
+        title_bar->menu_bar = nullptr;
+        title_bar->navigation = nullptr;
+        title_bar->title_bar = nullptr;
+        title_bar->source = nullptr;
+        /* AppWindow installs native title-bar handling on the owner HWND.
+           Retain that projection until after DestroyWindow has completed;
+           releasing it here leaves the native teardown callback without its
+           WinRT owner and crashes inside the generated ABI thunk. */
     } catch (...) {
     }
-    delete title_bar;
 }
 
 extern "C" void vm_native_titlebar_resize(VmNativeTitleBar *title_bar)

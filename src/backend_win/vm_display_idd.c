@@ -2925,11 +2925,12 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         if (!idd_resize_window_for_content(
                 d, d->initial_width, d->initial_height, 0)) {
             ui_log(L"IDD: failed to preserve the requested content size after title-bar attachment.");
+            vm_native_titlebar_close_island(d->native_title_bar);
+            DestroyWindow(d->hwnd);
+            d->hwnd = NULL;
             vm_native_titlebar_destroy(d->native_title_bar);
             d->native_title_bar = NULL;
             d->title_bar_height = 0;
-            DestroyWindow(d->hwnd);
-            d->hwnd = NULL;
             d->open = FALSE;
             CoUninitialize();
             return 1;
@@ -2967,8 +2968,14 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     }
     if (!d->render_hwnd) {
         ui_log(L"IDD: Failed to establish render target (0x%08X).", GetLastError());
+        vm_native_titlebar_close_island(d->native_title_bar);
         DestroyWindow(d->hwnd);
         d->hwnd = NULL;
+        if (d->native_title_bar) {
+            vm_native_titlebar_destroy(d->native_title_bar);
+            d->native_title_bar = NULL;
+            d->title_bar_height = 0;
+        }
         d->open = FALSE;
         if (com_initialized)
             CoUninitialize();
@@ -3030,8 +3037,14 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             CloseHandle(d->render_thread);
             d->render_thread = NULL;
         }
+        vm_native_titlebar_close_island(d->native_title_bar);
         DestroyWindow(d->hwnd);
         d->hwnd = NULL;
+        if (d->native_title_bar) {
+            vm_native_titlebar_destroy(d->native_title_bar);
+            d->native_title_bar = NULL;
+            d->title_bar_height = 0;
+        }
         d->open = FALSE;
         if (com_initialized)
             CoUninitialize();
@@ -3047,8 +3060,14 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         WaitForSingleObject(d->render_thread, RENDER_START_TIMEOUT_MS);
         CloseHandle(d->render_thread);
         d->render_thread = NULL;
+        vm_native_titlebar_close_island(d->native_title_bar);
         DestroyWindow(d->hwnd);
         d->hwnd = NULL;
+        if (d->native_title_bar) {
+            vm_native_titlebar_destroy(d->native_title_bar);
+            d->native_title_bar = NULL;
+            d->title_bar_height = 0;
+        }
         d->open = FALSE;
         if (com_initialized)
             CoUninitialize();
@@ -3258,12 +3277,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 DestroyIcon(d->custom_icon);
                 d->custom_icon = NULL;
             }
-            if (d->native_title_bar) {
-                vm_native_titlebar_destroy(d->native_title_bar);
-                d->native_title_bar = NULL;
-                d->title_bar_height = 0;
-            }
-
+            /* Keep the island projections alive through native owner-window
+               destruction. DesktopWindowXamlSource receives the HWND teardown
+               synchronously; closing it first leaves its installed window
+               callback pointing at already-released XAML content. The thread
+               releases the island immediately after its message loop exits. */
             /* Notify main UI only if user closed the window */
             if (user_initiated && d->main_hwnd && d->vm)
                 PostMessageW(d->main_hwnd, WM_VM_DISPLAY_CLOSED,
@@ -3276,11 +3294,6 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         KillTimer(hwnd, IDT_RESIZE_DEBOUNCE);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) {
-            if (d->native_title_bar) {
-                vm_native_titlebar_destroy(d->native_title_bar);
-                d->native_title_bar = NULL;
-                d->title_bar_height = 0;
-            }
             /* Application mode aliases render_hwnd to the top-level HWND. Do
                not leave a destroyed HWND behind for late cursor/focus guards. */
             if (d->render_hwnd == hwnd)

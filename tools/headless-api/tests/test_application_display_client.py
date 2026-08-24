@@ -341,6 +341,8 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("DesktopWindowXamlSource", title_bar)
         self.assertIn("ExtendsContentIntoTitleBar(true)", title_bar)
         self.assertIn("TitleBar create_title_bar", title_bar)
+        self.assertIn("NativeTitleBarApp", title_bar)
+        self.assertIn("native_app_runtime_consumed.exchange(true)", title_bar)
         self.assertIn("ContentPreTranslateMessage", title_bar)
         self.assertIn("SetDragRectangles", title_bar)
         self.assertIn('L"SidebarToggleButton"', title_bar)
@@ -349,6 +351,7 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("vm_native_titlebar_create(", source)
         self.assertIn("vm_native_titlebar_pretranslate_message(", source)
         self.assertIn("vm_native_titlebar_resize(", source)
+        self.assertIn("vm_native_titlebar_close_island(", source)
         self.assertIn("idd_get_content_size", source)
         self.assertIn("idd_resize_window_for_content", source)
         self.assertIn("d->render_height - d->title_bar_height", source)
@@ -369,6 +372,11 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("Microsoft.WindowsAppSDK.WinUI", project)
         self.assertIn("<CompileAs>CompileAsCpp</CompileAs>", project)
         self.assertIn("<WindowsPackageType>None</WindowsPackageType>", project)
+        self.assertIn("NativeTitleBarApp.xaml", project)
+        app_xaml = (
+            root / "src" / "backend_win" / "NativeTitleBarApp.xaml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("XamlControlsResources", app_xaml)
 
         # One production HWND owns the frame, swap chain, startup surface, and
         # XAML Island. The integration must not regress to custom non-client
@@ -376,6 +384,15 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("d->render_hwnd = d->hwnd", source)
         self.assertNotIn("WM_NCCALCSIZE", source)
         self.assertNotIn("SetTimer(hwnd, IDT_PRESENT", source)
+
+        window_proc = source[source.rindex("static LRESULT CALLBACK idd_wnd_proc(") :]
+        close_handler = window_proc[
+            window_proc.index("case WM_CLOSE:") : window_proc.index("case WM_DESTROY:")
+        ]
+        self.assertNotIn("vm_native_titlebar_destroy", close_handler)
+        self.assertNotIn("vm_native_titlebar_close_island", close_handler)
+        self.assertIn("DestroyWindow(hwnd)", close_handler)
+        self.assertNotIn("case WM_NCDESTROY:", source)
 
     def test_title_bar_does_not_replace_the_qualified_resize_state_machine(self):
         root = Path(__file__).resolve().parents[3]

@@ -213,8 +213,9 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
   <ItemDefinitionGroup>
     <ClCompile>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(ProjectDir)packages\Microsoft.WindowsAppSDK.Foundation.2.3.9\include;$(ProjectDir)packages\Microsoft.WindowsAppSDK.Runtime.2.4.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)packages\Microsoft.WindowsAppSDK.Foundation.2.3.9\include;$(ProjectDir)packages\Microsoft.WindowsAppSDK.Runtime.2.4.0\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <PreprocessorDefinitions>DISABLE_XAML_GENERATED_MAIN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <AdditionalDependencies>user32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
@@ -232,6 +233,18 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
       <CompileAs>CompileAsCpp</CompileAs>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Include="src\backend_win\NativeTitleBarApp.xaml.cpp">
+      <CompileAs>CompileAsCpp</CompileAs>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <DependentUpon>NativeTitleBarApp.xaml</DependentUpon>
+    </ClCompile>
+    <ClCompile Include="$(GeneratedFilesDir)module.g.cpp">
+      <CompileAs>CompileAsCpp</CompileAs>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ForcedIncludeFiles>unknwn.h;%(ForcedIncludeFiles)</ForcedIncludeFiles>
     </ClCompile>
     <ClCompile Include="src\app_win\webview2_bridge.c" />
     <ClCompile Include="src\app_win\headless.c" />
@@ -251,12 +264,24 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClInclude Include="src\backend_win\vm_startup_scene.h" />
     <ClInclude Include="src\backend_win\vm_window_chrome.h" />
     <ClInclude Include="src\backend_win\vm_native_titlebar.h" />
+    <ClInclude Include="src\backend_win\NativeTitleBarApp.xaml.h">
+      <DependentUpon>NativeTitleBarApp.xaml</DependentUpon>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\app_win\appsandbox.rc" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
+  </ItemGroup>
+  <ItemGroup>
+    <ApplicationDefinition Include="src\backend_win\NativeTitleBarApp.xaml" />
+  </ItemGroup>
+  <ItemGroup>
+    <Midl Include="src\backend_win\NativeTitleBarApp.idl">
+      <DependentUpon>NativeTitleBarApp.xaml</DependentUpon>
+      <SubType>Code</SubType>
+    </Midl>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
