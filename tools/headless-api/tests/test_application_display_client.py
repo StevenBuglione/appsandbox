@@ -360,6 +360,11 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("title_bar_hosted", source)
 
         self.assertIn('json_get_string(body, L"titleBarLayout"', api)
+        self.assertIn('wchar_t title_bar_theme[16] = L"system"', api)
+        self.assertIn('wchar_t title_bar_layout[24] = L"caption-only"', api)
+        self.assertIn(
+            "display_options.window_chrome.theme = ASB_TITLE_BAR_DARK", api
+        )
         self.assertIn('L"compact"', api)
         self.assertIn('L"caption-only"', api)
         self.assertIn('L"visible"', api)

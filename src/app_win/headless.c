@@ -898,9 +898,9 @@ static int handle_request(PHTTP_REQUEST req)
                 wchar_t title[256] = L"Linguum Runtime POC";
                 wchar_t app_id[256] = L"com.linguum.Runtime.POC";
                 wchar_t icon_path[MAX_PATH] = {0};
-                wchar_t title_bar_theme[16] = L"dark";
+                wchar_t title_bar_theme[16] = L"system";
                 wchar_t title_bar_corner[24] = L"system";
-                wchar_t title_bar_layout[24] = L"compact";
+                wchar_t title_bar_layout[24] = L"caption-only";
                 wchar_t title_bar_sidebar[16] = L"visible";
                 wchar_t title_bar_navigation[16] = L"visible";
                 wchar_t title_bar_menu[16] = L"desktop";
@@ -1033,7 +1033,9 @@ static int handle_request(PHTTP_REQUEST req)
                     display_options.window_chrome.theme = ASB_TITLE_BAR_SYSTEM;
                 } else if (_wcsicmp(title_bar_theme, L"light") == 0) {
                     display_options.window_chrome.theme = ASB_TITLE_BAR_LIGHT;
-                } else if (_wcsicmp(title_bar_theme, L"dark") != 0) {
+                } else if (_wcsicmp(title_bar_theme, L"dark") == 0) {
+                    display_options.window_chrome.theme = ASB_TITLE_BAR_DARK;
+                } else {
                     send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                              "titleBarTheme must be 'system', 'light', or 'dark'");
                     return 0;
