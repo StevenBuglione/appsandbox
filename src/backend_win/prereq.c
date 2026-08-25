@@ -6,6 +6,94 @@
 #define PREREQ_PIPE_BUF 8192
 #define PREREQ_FEATURE  L"VirtualMachinePlatform"
 
+typedef void (CALLBACK *PREREQ_HCS_OPERATION_COMPLETION)(void *operation, void *context);
+typedef void *(WINAPI *PFN_PrereqHcsCreateOperation)(
+    const void *context, PREREQ_HCS_OPERATION_COMPLETION callback);
+typedef HRESULT (WINAPI *PFN_PrereqHcsEnumerateComputeSystems)(
+    PCWSTR query, void *operation);
+typedef HRESULT (WINAPI *PFN_PrereqHcsWaitForOperationResult)(
+    void *operation, DWORD timeout_ms, PWSTR *result_document);
+typedef void (WINAPI *PFN_PrereqHcsCloseOperation)(void *operation);
+
+/* DISM's online feature query now requires elevation on some supported Windows
+ * builds, and its human-readable output is localized.  Probe the capability
+ * App Sandbox actually consumes when that text query cannot prove the feature
+ * is enabled.  This is read-only, uses only the system ComputeCore DLL, and
+ * does not create or modify a compute system. */
+static BOOL prereq_hcs_is_available(void)
+{
+    HMODULE module = NULL;
+    PFN_PrereqHcsCreateOperation create_operation = NULL;
+    PFN_PrereqHcsEnumerateComputeSystems enumerate_systems = NULL;
+    PFN_PrereqHcsWaitForOperationResult wait_operation = NULL;
+    PFN_PrereqHcsCloseOperation close_operation = NULL;
+    void *operation = NULL;
+    PWSTR result_document = NULL;
+    HRESULT result = E_FAIL;
+
+    module = LoadLibraryExW(L"computecore.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module)
+        return FALSE;
+
+    create_operation = (PFN_PrereqHcsCreateOperation)GetProcAddress(
+        module, "HcsCreateOperation");
+    enumerate_systems = (PFN_PrereqHcsEnumerateComputeSystems)GetProcAddress(
+        module, "HcsEnumerateComputeSystems");
+    wait_operation = (PFN_PrereqHcsWaitForOperationResult)GetProcAddress(
+        module, "HcsWaitForOperationResult");
+    close_operation = (PFN_PrereqHcsCloseOperation)GetProcAddress(
+        module, "HcsCloseOperation");
+    if (!create_operation || !enumerate_systems || !wait_operation || !close_operation)
+        goto cleanup;
+
+    operation = create_operation(NULL, NULL);
+    if (!operation)
+        goto cleanup;
+
+    result = enumerate_systems(L"{}", operation);
+    if (SUCCEEDED(result))
+        result = wait_operation(operation, 5000, &result_document);
+
+cleanup:
+    if (result_document)
+        LocalFree(result_document);
+    if (operation && close_operation)
+        close_operation(operation);
+    FreeLibrary(module);
+    return SUCCEEDED(result);
+}
+
+/* A medium-integrity desktop process can be denied HCS enumeration even when
+ * the feature is healthy.  The Host Compute Service is installed only when a
+ * Windows compute feature capable of serving App Sandbox is present.  Its
+ * demand-start configuration is therefore a stable, locale-independent
+ * fallback that does not require starting or modifying the service. */
+static BOOL prereq_hcs_service_is_installed(void)
+{
+    SC_HANDLE manager = NULL;
+    SC_HANDLE service = NULL;
+    BOOL installed = FALSE;
+
+    manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!manager)
+        return FALSE;
+    service = OpenServiceW(manager, L"vmcompute", SERVICE_QUERY_CONFIG);
+    if (service) {
+        union {
+            QUERY_SERVICE_CONFIGW config;
+            BYTE bytes[8192];
+        } query;
+        DWORD required = 0;
+        ZeroMemory(&query, sizeof(query));
+        if (QueryServiceConfigW(service, &query.config, (DWORD)sizeof(query), &required) &&
+            query.config.dwStartType != SERVICE_DISABLED)
+            installed = TRUE;
+        CloseServiceHandle(service);
+    }
+    CloseServiceHandle(manager);
+    return installed;
+}
+
 BOOL prereq_is_feature_enabled(const wchar_t *feature_name)
 {
     BOOL enabled = FALSE;
@@ -18,6 +106,13 @@ BOOL prereq_is_feature_enabled(const wchar_t *feature_name)
     char buf[PREREQ_PIPE_BUF];
     DWORD total = 0;
     DWORD bytes_read = 0;
+
+    /* This is the normal path on Windows 11.  Avoid launching elevated DISM
+     * when the installed compute service already proves the capability is
+     * available to App Sandbox. */
+    if (wcscmp(feature_name, PREREQ_FEATURE) == 0 &&
+        (prereq_hcs_service_is_installed() || prereq_hcs_is_available()))
+        return TRUE;
 
     _snwprintf_s(cmd, 512, _TRUNCATE,
         L"C:\\Windows\\System32\\dism.exe /online /Get-FeatureInfo /FeatureName:%ls",
