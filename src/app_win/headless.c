@@ -114,6 +114,17 @@ static void display_drop(DisplayEntry *e)   /* destroy the window + free the slo
     if (e->disp) vm_display_idd_destroy(e->disp);
     e->disp = NULL; e->vm_id = 0;
 }
+
+/* Programmatic display teardown does not travel through the user-initiated
+   WM_CLOSE callback. Publish the same lifecycle event explicitly so an
+   installed runtime that owns the window can release its exact child
+   processes and VM instead of waiting for an unrelated session timeout. */
+static void display_drop_notifying(DisplayEntry *e, const wchar_t *vm_name)
+{
+    if (!e || !e->disp) return;
+    display_drop(e);
+    display_closed(vm_name, NULL);
+}
 /* TRUE if this VM has a live (not user-closed) display window. */
 static BOOL display_is_open(UINT64 vm_id)
 {
@@ -895,7 +906,7 @@ static int handle_request(PHTTP_REQUEST req)
                          "wait for the build to finish, then delete");
                 return 0;
             }
-            if (dv) display_drop(display_find(dv->unique_id));   /* close its display window first */
+            if (dv) display_drop_notifying(display_find(dv->unique_id), dv->name);   /* close its display window first */
             send_hr(req->RequestId, "delete", nu, asb_vm_delete(vm));
             return 0;
         }
@@ -1473,7 +1484,7 @@ static int handle_request(PHTTP_REQUEST req)
                 return 0;
             }
             if (verb == HttpVerbDELETE) {
-                display_drop(display_find(v->unique_id));
+                display_drop_notifying(display_find(v->unique_id), v->name);
                 send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"displayOpen\":false}");
                 return 0;
             }

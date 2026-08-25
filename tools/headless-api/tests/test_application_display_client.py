@@ -440,6 +440,21 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("presentedFrames", api)
         self.assertIn("presentCount", api)
 
+    def test_programmatic_display_teardown_publishes_the_close_event(self):
+        root = Path(__file__).resolve().parents[3]
+        api = (root / "src" / "app_win" / "headless.c").read_text(encoding="utf-8")
+
+        helper_start = api.index("static void display_drop_notifying")
+        helper_end = api.index("/* TRUE if this VM", helper_start)
+        helper = api[helper_start:helper_end]
+        self.assertLess(helper.index("display_drop(e)"), helper.index("display_closed("))
+        self.assertIn(
+            "display_drop_notifying(display_find(dv->unique_id), dv->name)", api
+        )
+        self.assertIn(
+            "display_drop_notifying(display_find(v->unique_id), v->name)", api
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
