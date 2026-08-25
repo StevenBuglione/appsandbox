@@ -52,6 +52,36 @@
 static void broadcast_event(const char *json);
 static int  append_wstr(char *out, int cap, int pos, const wchar_t *w);
 
+static void display_bounds_changed(const wchar_t *vm_name,
+                                   UINT width,
+                                   UINT height,
+                                   BOOL interactive,
+                                   void *context)
+{
+    char event[1024];
+    int position;
+    (void)context;
+    position = sprintf_s(event, sizeof(event),
+                         "{\"version\":1,\"event\":\"displayBoundsChanged\",\"name\":");
+    position = append_wstr(event, sizeof(event), position, vm_name);
+    sprintf_s(event + position, sizeof(event) - position,
+              ",\"width\":%u,\"height\":%u,\"interactive\":%s}",
+              width, height, interactive ? "true" : "false");
+    broadcast_event(event);
+}
+
+static void display_closed(const wchar_t *vm_name, void *context)
+{
+    char event[768];
+    int position;
+    (void)context;
+    position = sprintf_s(event, sizeof(event),
+                         "{\"version\":1,\"event\":\"displayClosed\",\"name\":");
+    position = append_wstr(event, sizeof(event), position, vm_name);
+    sprintf_s(event + position, sizeof(event) - position, "}");
+    broadcast_event(event);
+}
+
 /* ---- SSE event broadcast (GET /v1/events) ---- */
 #define EV_CAP 256
 static CRITICAL_SECTION   g_ev_cs;
@@ -945,6 +975,10 @@ static int handle_request(PHTTP_REQUEST req)
                 display_options.show_debug_title = !display_options.app_mode;
                 display_options.show_debug_overlay = !display_options.app_mode;
                 display_options.show_on_open = TRUE;
+                display_options.bounds_changed = display_bounds_changed;
+                display_options.bounds_changed_context = NULL;
+                display_options.closed = display_closed;
+                display_options.closed_context = NULL;
                 display_options.window_chrome.theme = ASB_TITLE_BAR_DARK;
                 display_options.window_chrome.corner_preference =
                     ASB_WINDOW_CORNER_SYSTEM;

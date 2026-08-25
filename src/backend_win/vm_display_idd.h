@@ -8,6 +8,14 @@
 
 typedef struct VmDisplayIdd VmDisplayIdd;
 
+typedef void (*AsbDisplayBoundsChangedCallback)(const wchar_t *vm_name,
+                                                UINT width,
+                                                UINT height,
+                                                BOOL interactive,
+                                                void *context);
+typedef void (*AsbDisplayClosedCallback)(const wchar_t *vm_name,
+                                         void *context);
+
 typedef struct AsbDisplayRuntimeState {
     UINT64 received_frames;
     UINT64 presented_frames;
@@ -40,6 +48,10 @@ typedef struct AsbDisplayOptions {
     BOOL show_debug_title;
     BOOL show_debug_overlay;
     BOOL show_on_open;
+    AsbDisplayBoundsChangedCallback bounds_changed;
+    void *bounds_changed_context;
+    AsbDisplayClosedCallback closed;
+    void *closed_context;
     AsbWindowChromeOptions window_chrome;
     AsbStartupOptions startup;
 } AsbDisplayOptions;

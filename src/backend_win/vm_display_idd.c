@@ -250,6 +250,10 @@ struct VmDisplayIdd {
     BOOL         show_debug_title;
     BOOL         show_debug_overlay;
     BOOL         show_on_open;
+    AsbDisplayBoundsChangedCallback bounds_changed;
+    void        *bounds_changed_context;
+    AsbDisplayClosedCallback closed;
+    void        *closed_context;
     HICON        custom_icon;
     AsbWindowChromeOptions window_chrome;
     VmNativeTitleBar *native_title_bar;
@@ -633,6 +637,17 @@ static BOOL idd_get_content_size(VmDisplayIdd *d, HWND hwnd,
     return TRUE;
 }
 
+static void idd_publish_content_bounds(VmDisplayIdd *d, HWND hwnd)
+{
+    UINT width, height;
+
+    if (!d || !d->bounds_changed ||
+        !idd_get_content_size(d, hwnd, &width, &height))
+        return;
+    d->bounds_changed(d->vm_name, width, height, d->in_size_move,
+                      d->bounds_changed_context);
+}
+
 static BOOL idd_resize_window_for_content(VmDisplayIdd *d,
                                           UINT width,
                                           UINT height,
@@ -773,6 +788,7 @@ static void idd_end_interactive_resize(VmDisplayIdd *d, HWND hwnd)
     idd_request_render(d, TRUE);
     idd_update_desired_resize(d, hwnd);
     idd_queue_desired_resize(d);
+    idd_publish_content_bounds(d, hwnd);
 }
 
 static void idd_queue_desired_resize(VmDisplayIdd *d)
@@ -3283,6 +3299,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                callback pointing at already-released XAML content. The thread
                releases the island immediately after its message loop exits. */
             /* Notify main UI only if user closed the window */
+            if (user_initiated && d->closed)
+                d->closed(d->vm_name, d->closed_context);
             if (user_initiated && d->main_hwnd && d->vm)
                 PostMessageW(d->main_hwnd, WM_VM_DISPLAY_CLOSED,
                              1, (LPARAM)d->vm);
@@ -3397,6 +3415,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                    capacity here, so this latest-value worker naturally no-ops;
                    its application controller changes only logical scene size. */
                 idd_queue_desired_resize(d);
+                idd_publish_content_bounds(d, hwnd);
                 if (!d->in_size_move)
                     SetTimer(hwnd, IDT_RESIZE_DEBOUNCE,
                              RESIZE_DEBOUNCE_MS, NULL);
@@ -3747,6 +3766,10 @@ VmDisplayIdd *vm_display_idd_create_ex(VmInstance *vm, HINSTANCE hInstance,
     d->show_debug_title   = options ? options->show_debug_title : TRUE;
     d->show_debug_overlay = options ? options->show_debug_overlay : TRUE;
     d->show_on_open       = options ? options->show_on_open : TRUE;
+    d->bounds_changed     = options ? options->bounds_changed : NULL;
+    d->bounds_changed_context = options ? options->bounds_changed_context : NULL;
+    d->closed             = options ? options->closed : NULL;
+    d->closed_context     = options ? options->closed_context : NULL;
     ZeroMemory(&d->window_chrome, sizeof(d->window_chrome));
     d->window_chrome.theme = ASB_TITLE_BAR_DARK;
     d->window_chrome.corner_preference = ASB_WINDOW_CORNER_SYSTEM;
