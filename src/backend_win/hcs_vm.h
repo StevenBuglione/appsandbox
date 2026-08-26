@@ -216,6 +216,6 @@ wchar_t *hcs_query_properties(VmInstance *instance, const wchar_t *query);
 
 /* Find a running VM's RuntimeId by enumerating all HCS compute systems.
    Returns TRUE if found. Does not require a valid HCS_SYSTEM handle. */
-BOOL hcs_find_runtime_id(const wchar_t *vm_name, GUID *out);
+ASB_API BOOL hcs_find_runtime_id(const wchar_t *vm_name, GUID *out);
 
 #endif /* HCS_VM_H */

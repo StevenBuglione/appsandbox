@@ -185,6 +185,7 @@ methods return `(http_status, body)` so you can branch on the status code.
 | `host()` | `{hostCores, hostRamMb, freeGb, vmCores, vmRamMb, vmHddGb}` (capacity + what running/declared VMs use) |
 | `list()` | list of VM status objects |
 | `status(name)` | one VM's status (raises `KeyError` on 404) |
+| `transport(name)` | Windows-only running VM Hyper-V socket identity; `409` until ready |
 | `ssh_info(name)` | `{host, port, user, sshState, enabled, keyDeployed}` (loopback-forwarded SSH; `sshState 4` = ready + key deployed) |
 | `templates()` | `[{name, osType}, …]` |
 | `snapshots(name)` | list of `{index, name, branchCount, branches:[…]}` |
@@ -193,6 +194,12 @@ methods return `(http_status, body)` so you can branch on the status code.
 A **status object** has: `name, osType, state, running, agentOnline,
 installComplete, building, progress, sshState, sshPort, ramMb, hddGb, cpuCores,
 gpuMode, networkMode, displayOpen`.
+
+`transport(name)` is an authenticated, host-only coordination endpoint. On
+Windows it returns
+`{version, transport: "hyperv-socket", vmRuntimeId}` for the exact running VM.
+The RuntimeId is intentionally absent from list/status responses and the method
+returns `409` while the VM is stopped or HCS has not published the identity.
 
 ### Lifecycle  *(return `(status, body)`)*
 | Method | Effect |

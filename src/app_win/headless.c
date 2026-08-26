@@ -29,6 +29,7 @@
 
 #include "headless.h"
 #include "asb_core.h"          /* full API incl. internal VmInstance */
+#include "hcs_vm.h"            /* bounded RuntimeId lookup for VM-scoped transports */
 #include "webview2_bridge.h"   /* json_get_string/int/bool for request bodies */
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
 #include "vm_display_idd.h"    /* IDD display window, opened on demand via the API */
@@ -337,6 +338,43 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
         (unsigned long)v->ram_mb, (unsigned long)v->hdd_gb, (unsigned long)v->cpu_cores,
         v->gpu_mode, v->network_mode,
         display_is_open(v->unique_id) ? "true" : "false");
+    return pos;
+}
+
+static BOOL runtime_id_is_zero(const GUID *value)
+{
+    static const GUID zero = {0};
+    return memcmp(value, &zero, sizeof(*value)) == 0;
+}
+
+static int append_runtime_transport_json(char *out, int cap, VmInstance *v)
+{
+    GUID runtime_id = v->runtime_id;
+    int pos;
+
+    if (!v->running)
+        return 0;
+    if (runtime_id_is_zero(&runtime_id)) {
+        if (!hcs_find_runtime_id(v->name, &runtime_id))
+            return 0;
+        v->runtime_id = runtime_id;
+    }
+    pos = sprintf_s(out, cap,
+        "{\"version\":1,\"transport\":\"hyperv-socket\",\"vmRuntimeId\":\""
+        "%08lx-%04x-%04x-",
+        (unsigned long)runtime_id.Data1,
+        (unsigned)runtime_id.Data2,
+        (unsigned)runtime_id.Data3);
+    pos += sprintf_s(out + pos, cap - pos,
+        "%02x%02x-%02x%02x%02x%02x%02x%02x\"}",
+        (unsigned)runtime_id.Data4[0],
+        (unsigned)runtime_id.Data4[1],
+        (unsigned)runtime_id.Data4[2],
+        (unsigned)runtime_id.Data4[3],
+        (unsigned)runtime_id.Data4[4],
+        (unsigned)runtime_id.Data4[5],
+        (unsigned)runtime_id.Data4[6],
+        (unsigned)runtime_id.Data4[7]);
     return pos;
 }
 
@@ -878,6 +916,25 @@ static int handle_request(PHTTP_REQUEST req)
         }
 
         /* sub-routes */
+        if (verb == HttpVerbGET && wcscmp(sub, L"transport") == 0) {
+            VmInstance *inst = asb_vm_instance(vm);
+            if (!inst) {
+                send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM");
+                return 0;
+            }
+            if (!inst->running) {
+                send_err(req->RequestId, 409, "Conflict", "vm_not_running",
+                         "VM transport identity is unavailable while stopped");
+                return 0;
+            }
+            if (append_runtime_transport_json(buf, sizeof(buf), inst) <= 0) {
+                send_err(req->RequestId, 409, "Conflict", "transport_not_ready",
+                         "VM transport identity is not ready");
+                return 0;
+            }
+            send_json(req->RequestId, 200, "OK", buf);
+            return 0;
+        }
         if (verb == HttpVerbPOST && wcscmp(sub, L"start") == 0) {
             /* Optional: boot from a chosen snapshot/branch -- mirrors the GUI's
                startVm (snapIndex/branchIndex/branchName). Starting from a

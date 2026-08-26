@@ -138,6 +138,7 @@ class Client:
     def templates(self):         return self._req("GET", "/templates")[1].get("templates", [])
     def delete_template(self, name): return self._req("DELETE", "/templates/" + name)
     def ssh_info(self, name):    return self._req("GET", "/vms/%s/sshInfo" % name)[1]
+    def transport(self, name):   return self._req("GET", "/vms/%s/transport" % name)[1]
     def open_display(self, name, **options):
         """Open the VM's display window on the daemon's local desktop (the GUI's
         Connect view). The VM must be running, and the daemon must be in an
