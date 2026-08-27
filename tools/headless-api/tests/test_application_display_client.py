@@ -288,6 +288,21 @@ class ApplicationDisplayClientTests(unittest.TestCase):
         self.assertIn("d3d_render_frame(d)", render_worker)
         self.assertIn("d3d_cleanup(d)", render_worker)
 
+    def test_guest_cursor_matches_the_windows_dpi_cursor_metric(self):
+        root = Path(__file__).resolve().parents[3]
+        source = (root / "src" / "backend_win" / "vm_display_idd.c").read_text(
+            encoding="utf-8"
+        )
+        cursor_factory = source[
+            source.index("static HCURSOR create_cursor_from_bitmap") : source.index(
+                "static void clip_log_callback"
+            )
+        ]
+        self.assertIn("GetDpiForWindow(target_window)", cursor_factory)
+        self.assertIn("GetSystemMetricsForDpi(SM_CXCURSOR, dpi)", cursor_factory)
+        self.assertIn("GetSystemMetricsForDpi(SM_CYCURSOR, dpi)", cursor_factory)
+        self.assertIn("CopyImage(result, IMAGE_CURSOR", cursor_factory)
+
     def test_startup_scene_uses_the_existing_native_swap_chain(self):
         root = Path(__file__).resolve().parents[3]
         source = (root / "src" / "backend_win" / "vm_display_idd.c").read_text(

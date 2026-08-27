@@ -2290,7 +2290,8 @@ static DWORD WINAPI idd_render_thread_proc(LPVOID param)
 #define CURSOR_TYPE_MASKED_COLOR  1
 #define CURSOR_TYPE_ALPHA         2
 
-static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
+static HCURSOR create_cursor_from_bitmap(HWND target_window,
+                                          UINT width, UINT height,
                                           UINT xhot, UINT yhot,
                                           UINT cursor_type, UINT pitch,
                                           UINT shape_data_size,
@@ -2476,6 +2477,21 @@ static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
     DeleteObject(hColor);
     DeleteObject(hMask);
 
+    if (result) {
+        UINT dpi = target_window ? GetDpiForWindow(target_window) : USER_DEFAULT_SCREEN_DPI;
+        int target_width = GetSystemMetricsForDpi(SM_CXCURSOR, dpi);
+        int target_height = GetSystemMetricsForDpi(SM_CYCURSOR, dpi);
+        if (target_width > 0 && target_height > 0 &&
+            (width != (UINT)target_width || height != (UINT)target_height)) {
+            HCURSOR scaled = (HCURSOR)CopyImage(result, IMAGE_CURSOR,
+                                                 target_width, target_height, 0);
+            if (scaled) {
+                DestroyCursor(result);
+                result = scaled;
+            }
+        }
+    }
+
     return result;
 }
 
@@ -2617,6 +2633,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     /* Create new cursor from bitmap */
                     {
                         HCURSOR new_cursor = create_cursor_from_bitmap(
+                            d->render_hwnd,
                             chdr.width, chdr.height, chdr.xhot, chdr.yhot,
                             chdr.cursor_type, chdr.pitch,
                             chdr.shape_data_size, cursor_buf);
