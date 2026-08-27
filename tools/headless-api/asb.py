@@ -168,6 +168,16 @@ class Client:
     def end_display_resize(self, name):
         """End the resize and commit its newest geometry to the guest once."""
         return self._req("PUT", "/vms/%s/display" % name, {"phase": "end"})
+    def command_display_window(self, name, command):
+        """Apply one reviewed window command to this VM's owned display."""
+        allowed = {
+            "minimize", "maximize", "restore",
+            "enterFullscreen", "exitFullscreen",
+        }
+        if command not in allowed:
+            raise ValueError("unsupported display window command: %r" % command)
+        return self._req("PUT", "/vms/%s/display" % name,
+                         {"windowCommand": command})
     def set_display_startup_state(self, name, phase, detailed=None):
         """Update one display's bounded host-owned startup presentation."""
         body = {"startupPhase": phase}

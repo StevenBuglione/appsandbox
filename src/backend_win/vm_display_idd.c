@@ -153,6 +153,7 @@ typedef struct InputPacket {
 #define WM_IDD_RESIZE_PHASE     (WM_USER + 103)
 #define WM_IDD_STARTUP_TASKBAR  (WM_USER + 104)
 #define WM_IDD_TITLEBAR_ACTION  (WM_USER + 105)
+#define WM_IDD_WINDOW_COMMAND   (WM_USER + 106)
 
 #define IDT_RESIZE_DEBOUNCE 2002
 #define RESIZE_DEBOUNCE_MS  33
@@ -250,6 +251,10 @@ struct VmDisplayIdd {
     BOOL         show_debug_title;
     BOOL         show_debug_overlay;
     BOOL         show_on_open;
+    volatile LONG fullscreen;
+    WINDOWPLACEMENT fullscreen_restore_placement;
+    LONG_PTR      fullscreen_restore_style;
+    LONG_PTR      fullscreen_restore_exstyle;
     AsbDisplayBoundsChangedCallback bounds_changed;
     void        *bounds_changed_context;
     AsbDisplayClosedCallback closed;
@@ -677,6 +682,63 @@ static BOOL idd_resize_window_for_content(VmDisplayIdd *d,
         !idd_get_content_size(d, d->hwnd, &verified_width, &verified_height))
         return FALSE;
     return verified_width == width && verified_height == height;
+}
+
+static BOOL idd_set_fullscreen(VmDisplayIdd *d, HWND hwnd, BOOL fullscreen)
+{
+    MONITORINFO monitor;
+    LONG_PTR style;
+    LONG_PTR exstyle;
+
+    if (!d || !d->app_mode || !hwnd || !IsWindow(hwnd))
+        return FALSE;
+    if ((InterlockedCompareExchange(&d->fullscreen, 0, 0) != 0) ==
+        (fullscreen != FALSE))
+        return TRUE;
+
+    if (fullscreen) {
+        ZeroMemory(&d->fullscreen_restore_placement,
+                   sizeof(d->fullscreen_restore_placement));
+        d->fullscreen_restore_placement.length =
+            sizeof(d->fullscreen_restore_placement);
+        if (!GetWindowPlacement(hwnd, &d->fullscreen_restore_placement))
+            return FALSE;
+        d->fullscreen_restore_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        d->fullscreen_restore_exstyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        monitor.cbSize = sizeof(monitor);
+        if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                             &monitor))
+            return FALSE;
+        style = d->fullscreen_restore_style &
+                ~(WS_CAPTION | WS_THICKFRAME);
+        exstyle = d->fullscreen_restore_exstyle &
+                  ~(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE |
+                    WS_EX_CLIENTEDGE | WS_EX_STATICEDGE);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exstyle);
+        if (!SetWindowPos(hwnd, HWND_TOP,
+                          monitor.rcMonitor.left, monitor.rcMonitor.top,
+                          monitor.rcMonitor.right - monitor.rcMonitor.left,
+                          monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+                          SWP_NOOWNERZORDER | SWP_FRAMECHANGED)) {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, d->fullscreen_restore_style);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
+                              d->fullscreen_restore_exstyle);
+            return FALSE;
+        }
+        InterlockedExchange(&d->fullscreen, TRUE);
+        return TRUE;
+    }
+
+    SetWindowLongPtrW(hwnd, GWL_STYLE, d->fullscreen_restore_style);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, d->fullscreen_restore_exstyle);
+    if (!SetWindowPlacement(hwnd, &d->fullscreen_restore_placement) ||
+        !SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                      SWP_NOOWNERZORDER | SWP_FRAMECHANGED))
+        return FALSE;
+    InterlockedExchange(&d->fullscreen, FALSE);
+    return TRUE;
 }
 
 
@@ -3529,6 +3591,32 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
 
+    case WM_IDD_WINDOW_COMMAND:
+        if (!d || !d->app_mode)
+            return 0;
+        switch ((AsbDisplayWindowCommand)wp) {
+        case ASB_DISPLAY_WINDOW_MINIMIZE:
+            ShowWindow(hwnd, SW_MINIMIZE);
+            return IsIconic(hwnd) ? 1 : 0;
+        case ASB_DISPLAY_WINDOW_MAXIMIZE:
+            if (InterlockedCompareExchange(&d->fullscreen, 0, 0) != 0)
+                return 0;
+            ShowWindow(hwnd, SW_MAXIMIZE);
+            return IsZoomed(hwnd) ? 1 : 0;
+        case ASB_DISPLAY_WINDOW_RESTORE:
+            if (InterlockedCompareExchange(&d->fullscreen, 0, 0) != 0 &&
+                !idd_set_fullscreen(d, hwnd, FALSE))
+                return 0;
+            ShowWindow(hwnd, SW_RESTORE);
+            return !IsIconic(hwnd) && !IsZoomed(hwnd) ? 1 : 0;
+        case ASB_DISPLAY_WINDOW_ENTER_FULLSCREEN:
+            return idd_set_fullscreen(d, hwnd, TRUE) ? 1 : 0;
+        case ASB_DISPLAY_WINDOW_EXIT_FULLSCREEN:
+            return idd_set_fullscreen(d, hwnd, FALSE) ? 1 : 0;
+        default:
+            return 0;
+        }
+
     case WM_IDD_STARTUP_TASKBAR:
         if (d && d->taskbar) {
             TBPFLAG state = TBPF_INDETERMINATE;
@@ -4048,6 +4136,21 @@ BOOL vm_display_idd_set_resize_phase(VmDisplayIdd *display, BOOL active)
                                5000, &applied) != 0 && applied == 1;
 }
 
+BOOL vm_display_idd_window_command(VmDisplayIdd *display,
+                                   AsbDisplayWindowCommand command)
+{
+    DWORD_PTR applied = 0;
+    if (!display || !display->open || !display->app_mode ||
+        !display->hwnd || !IsWindow(display->hwnd) ||
+        command < ASB_DISPLAY_WINDOW_MINIMIZE ||
+        command > ASB_DISPLAY_WINDOW_EXIT_FULLSCREEN)
+        return FALSE;
+    return SendMessageTimeoutW(display->hwnd, WM_IDD_WINDOW_COMMAND,
+                               (WPARAM)command, 0,
+                               SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+                               5000, &applied) != 0 && applied == 1;
+}
+
 BOOL vm_display_idd_set_startup_state(VmDisplayIdd *display,
                                       AsbStartupPhase phase,
                                       BOOL detailed)
@@ -4099,6 +4202,12 @@ BOOL vm_display_idd_get_runtime_state(VmDisplayIdd *display,
             &display->startup_detailed, 0, 0) != 0;
     state->startup_phase = (AsbStartupPhase)InterlockedCompareExchange(
             &display->startup_phase, 0, 0);
+    if (display->hwnd && IsWindow(display->hwnd)) {
+        state->minimized = IsIconic(display->hwnd);
+        state->maximized = IsZoomed(display->hwnd);
+    }
+    state->fullscreen = InterlockedCompareExchange(
+            &display->fullscreen, 0, 0) != 0;
     EnterCriticalSection(&display->frame_cs);
     state->frame_width = display->frame_width;
     state->frame_height = display->frame_height;

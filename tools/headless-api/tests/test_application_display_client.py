@@ -95,6 +95,39 @@ class ApplicationDisplayClientTests(unittest.TestCase):
             ],
         )
 
+    def test_window_commands_are_bounded_to_the_owned_display(self):
+        client = asb.Client("http://127.0.0.1:1", "token")
+        with patch.object(client, "_req", return_value=(202, {})) as request:
+            for command in (
+                "minimize", "maximize", "restore",
+                "enterFullscreen", "exitFullscreen",
+            ):
+                client.command_display_window("vm", command)
+        self.assertEqual(
+            request.call_args_list,
+            [
+                unittest.mock.call(
+                    "PUT", "/vms/vm/display", {"windowCommand": command}
+                )
+                for command in (
+                    "minimize", "maximize", "restore",
+                    "enterFullscreen", "exitFullscreen",
+                )
+            ],
+        )
+
+        with self.assertRaisesRegex(ValueError, "unsupported display window command"):
+            client.command_display_window("vm", "sendArbitraryMessage")
+
+        header = (
+            Path(__file__).resolve().parents[3]
+            / "src"
+            / "backend_win"
+            / "vm_display_idd.h"
+        ).read_text(encoding="utf-8")
+        self.assertIn("vm_display_idd_window_command", header)
+        self.assertNotIn("HWND hwnd", header[header.index("vm_display_idd_window_command") :])
+
     def test_pointer_gestures_are_scoped_to_one_open_display(self):
         client = asb.Client("http://127.0.0.1:1", "token")
         with patch.object(client, "_req", return_value=(202, {})) as request:

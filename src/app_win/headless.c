@@ -1413,6 +1413,7 @@ static int handle_request(PHTTP_REQUEST req)
                 wchar_t phase[16] = L"";
                 wchar_t input[16] = L"";
                 wchar_t startup_phase[24] = L"";
+                wchar_t window_command[24] = L"";
                 int width = 0, height = 0;
                 if (!e || !e->disp) {
                     send_err(req->RequestId, 409, "Conflict", "display_not_open",
@@ -1420,6 +1421,43 @@ static int handle_request(PHTTP_REQUEST req)
                     return 0;
                 }
                 body_to_wide(req, body, 1024);
+                if (json_get_string(body, L"windowCommand", window_command, 24)) {
+                    AsbDisplayWindowCommand command;
+                    const char *command_name;
+                    if (_wcsicmp(window_command, L"minimize") == 0) {
+                        command = ASB_DISPLAY_WINDOW_MINIMIZE;
+                        command_name = "minimize";
+                    } else if (_wcsicmp(window_command, L"maximize") == 0) {
+                        command = ASB_DISPLAY_WINDOW_MAXIMIZE;
+                        command_name = "maximize";
+                    } else if (_wcsicmp(window_command, L"restore") == 0) {
+                        command = ASB_DISPLAY_WINDOW_RESTORE;
+                        command_name = "restore";
+                    } else if (_wcsicmp(window_command, L"enterFullscreen") == 0) {
+                        command = ASB_DISPLAY_WINDOW_ENTER_FULLSCREEN;
+                        command_name = "enterFullscreen";
+                    } else if (_wcsicmp(window_command, L"exitFullscreen") == 0) {
+                        command = ASB_DISPLAY_WINDOW_EXIT_FULLSCREEN;
+                        command_name = "exitFullscreen";
+                    } else {
+                        send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                                 "windowCommand is outside the supported set");
+                        return 0;
+                    }
+                    if (!vm_display_idd_window_command(e->disp, command)) {
+                        send_err(req->RequestId, 409, "Conflict",
+                                 "display_window_command_failed",
+                                 "the owned native display did not apply the window command");
+                        return 0;
+                    }
+                    sprintf_s(buf, sizeof(buf),
+                              "{\"ok\":true,\"displayOpen\":true,"
+                              "\"windowCommand\":\"%s\","
+                              "\"windowCommandApplied\":true}",
+                              command_name);
+                    send_json(req->RequestId, 202, "Accepted", buf);
+                    return 0;
+                }
                 if (json_get_string(body, L"startupPhase", startup_phase, 24)) {
                     AsbStartupPhase next_phase;
                     AsbDisplayRuntimeState state;
@@ -1565,7 +1603,9 @@ static int handle_request(PHTTP_REQUEST req)
                               "\"frameWidth\":%u,\"frameHeight\":%u,"
                               "\"titleBarHosted\":%s,\"titleBarHeight\":%u,"
                               "\"startupVisible\":%s,\"startupDetailed\":%s,"
-                              "\"startupPhase\":\"%s\"}",
+                              "\"startupPhase\":\"%s\","
+                              "\"minimized\":%s,\"maximized\":%s,"
+                              "\"fullscreen\":%s}",
                               state.received_frames, state.presented_frames,
                               state.present_count, state.guest_frame_sequence,
                               state.render_width, state.render_height,
@@ -1575,7 +1615,10 @@ static int handle_request(PHTTP_REQUEST req)
                               state.title_bar_height,
                               state.startup_visible ? "true" : "false",
                               state.startup_detailed ? "true" : "false",
-                              startup_phase_name(state.startup_phase));
+                              startup_phase_name(state.startup_phase),
+                              state.minimized ? "true" : "false",
+                              state.maximized ? "true" : "false",
+                              state.fullscreen ? "true" : "false");
                 } else {
                     sprintf_s(b, sizeof(b), "{\"open\":false,\"ready\":%s}",
                               ready ? "true" : "false");

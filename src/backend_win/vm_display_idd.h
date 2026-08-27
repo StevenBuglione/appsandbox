@@ -8,6 +8,14 @@
 
 typedef struct VmDisplayIdd VmDisplayIdd;
 
+typedef enum AsbDisplayWindowCommand {
+    ASB_DISPLAY_WINDOW_MINIMIZE = 1,
+    ASB_DISPLAY_WINDOW_MAXIMIZE = 2,
+    ASB_DISPLAY_WINDOW_RESTORE = 3,
+    ASB_DISPLAY_WINDOW_ENTER_FULLSCREEN = 4,
+    ASB_DISPLAY_WINDOW_EXIT_FULLSCREEN = 5
+} AsbDisplayWindowCommand;
+
 typedef void (*AsbDisplayBoundsChangedCallback)(const wchar_t *vm_name,
                                                 UINT width,
                                                 UINT height,
@@ -32,6 +40,9 @@ typedef struct AsbDisplayRuntimeState {
     BOOL startup_visible;
     BOOL startup_detailed;
     AsbStartupPhase startup_phase;
+    BOOL minimized;
+    BOOL maximized;
+    BOOL fullscreen;
 } AsbDisplayRuntimeState;
 
 typedef struct AsbDisplayOptions {
@@ -85,6 +96,12 @@ BOOL vm_display_idd_resize(VmDisplayIdd *display, UINT width, UINT height);
    arbitrary window message. A display with a fixed backing size never
    modesets here; its application controller changes only logical scene size. */
 BOOL vm_display_idd_set_resize_phase(VmDisplayIdd *display, BOOL active);
+
+/* Apply one reviewed native window command on the HWND-owning thread. The
+   caller names neither an HWND nor an arbitrary message, so the private API
+   remains scoped to the exact VM display it already owns. */
+BOOL vm_display_idd_window_command(VmDisplayIdd *display,
+                                   AsbDisplayWindowCommand command);
 
 /* Update the bounded, non-technical startup presentation. The native renderer
    keeps the startup scene visible until READY and one complete guest frame are
